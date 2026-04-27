@@ -1,0 +1,2473 @@
+# backend/main.py
+# V1.1 Agentic Trade Chatbot (No LangGraph, No embeddings)
+# - Router Agent (Gemini 2.5 Flash) controls intent/mode/clarifications/followups (Prompt A skeleton constrained)
+# - Prompt A/B/C handles execution logic
+# - Explicit state machine + followup memory
+# - No DB execution without confirmation
+#
+# NOTE: Prompts are intentionally NOT included. Paste your templates where marked.
+
+import os
+import re
+import json
+import uuid
+import time
+import datetime
+from pathlib import Path
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
+import requests
+import snowflake.connector
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+
+# =========================================================
+# PATHS / ENV
+# =========================================================
+BASE_DIR = Path(__file__).resolve().parent            # .../backend
+PROJECT_ROOT = BASE_DIR.parent                        # .../<project>
+FRONTEND_DIR = PROJECT_ROOT / "frontend"              # .../<project>/frontend
+ENV_PATH = PROJECT_ROOT / ".env"
+load_dotenv(ENV_PATH)
+
+# =========================================================
+# APP
+# =========================================================
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================================================
+# CONSTANTS / CONFIG
+# =========================================================
+# Session memory window (V1)
+HISTORY_TURNS = 10
+
+# States
+STATE_SETUP = "SETUP"
+STATE_IDLE = "IDLE"
+STATE_AWAITING_CLARIFICATION = "AWAITING_CLARIFICATION"
+STATE_AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+STATE_READY = "READY_FOR_NEW_QUERY"
+
+# Gemini
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "models/gemini-2.5-flash").strip()
+GEMINI_MODEL_URL = f"https://generativelanguage.googleapis.com/v1beta/{GEMINI_MODEL}:generateContent"
+
+NORMALIZE_MAX_TOKENS = int(os.getenv("NORMALIZE_MAX_TOKENS", "1000"))
+TRADE_AGENT_MAX_TOKENS = int(os.getenv("TRADE_AGENT_MAX_TOKENS", "2500"))
+PROMPT_A_MAX_TOKENS = int(os.getenv("PROMPT_A_MAX_TOKENS", "20000"))
+PROMPT_B_MAX_TOKENS = int(os.getenv("PROMPT_B_MAX_TOKENS", "5000"))
+PROMPT_C_MAX_TOKENS = int(os.getenv("PROMPT_C_MAX_TOKENS", "2500"))
+
+MAX_SQL_FIX_ATTEMPTS = int(os.getenv("MAX_SQL_FIX_ATTEMPTS", "3"))
+PORT = int(os.getenv("PORT", "8000"))
+
+# Snowflake
+SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT", "")
+SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER", "")
+SNOWFLAKE_PASSWORD = os.getenv("SNOWFLAKE_PASSWORD", "")
+SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "")
+SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE", "")
+SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
+SNOWFLAKE_ROLE = os.getenv("SNOWFLAKE_ROLE", "")
+
+# =========================================================
+# SCHEMA CONTEXT (passed to Trade Agent)
+# =========================================================
+SCHEMA_CONTEXT = """SCHEMA_CONTEXT (for grounding only)
+- SHIPPING_DATE (date): used for all time filters, comparisons, rolling windows
+- SHIPMENT_VALUE (numeric): monetary metric (default metric)
+- QUANTITY (numeric): volume metric (unit-sensitive)
+- UNIT (text): required only when aggregating quantity or computing price (unit-safe)
+- PRODUCT_DESCRIPTION (text): primary product filter when user mentions a product name
+- HS_CODE (text): hierarchical product identifier (use only if user provides HS digits or for “top products” grouping)
+- BUYER: BUYER_COMPANY, BUYER_COUNTRY, BUYER_STATE, BUYER_CITY, BUYER_ADDRESS
+- SELLER: SELLER_COMPANY, SELLER_COUNTRY, SELLER_STATE, SELLER_CITY, SELLER_ADDRESS
+- PORTS: PORT_OF_ORIGIN, PORT_OF_DESTINATION
+- DECL_NO (text): unique row identifier (never use as grouping/logical dimension)
+"""
+
+PROMPT_A_SKELETON_BIBLE=""" Prompt A Skeleton Bible (Core + Analytics) 
+
+Purpose: A capability + behavior map for the chatbot. Use it to (1) decide if a user request is executable, (2) ask minimal clarifications, (3) guide users like a senior trade advisor, (4) generate progressive followups. Do NOT include SQL or math internals here.
+
+ 1) What Prompt A can answer (DB-scope)
+Prompt A can produce database-backed answers for:
+
+Core
+- Discovery: top/list of buyers or sellers (exporters/importers) for a product/corridor.
+- Totals & counts: total trade value/quantity; count of buyers/sellers/shipments.
+- Price intelligence: average/best/cheap/expensive (unit-safe).
+- Ports & corridors: activity by port; “from/to/via” corridor questions.
+- New entrants: new buyers/suppliers/onboarded into a market/corridor.
+- Comparisons: compare periods/entities only when explicitly asked.
+
+Analytics engines
+- Trend: increasing/decreasing/stable over time (value/quantity/price).
+- Seasonality: historical peak/best month (cycle peak, not MoM unless asked).
+- Demand: markets where buyer-side demand is increasing; “demand in N countries” counts only increasing-demand markets.
+- Competition: low competition / best entry market; for opportunity intent, competition is evaluated only on demand-qualified markets.
+- High-Margin Buyers: premium-paying buyers (price proxy, unit-safe; not profit margin).
+- Market Saturation (optional): crowding/undersupply only if user asks; do not confuse with competition.
+
+DB-scope boundary (CRITICAL):
+If the user asks about buyers/sellers/ports/countries/cities/states/DECL_NO/shipment records/schema fields/“show SQL”/“why 0”/any trade data lookup, it is DB-scope and should be handled via Prompt A (after Confirm gate), not treated as off-topic.
+
+Out of scope (true off-topic):
+tariffs/duties/regulatory compliance, legal advice, forecasting the future, internet/company registration lookup. For these, answer generally (no DB) and steer back to an in-scope DB question.
+
+ 2) Minimum Entry Gate
+To run a trade query, Prompt A needs only:
+- Subject: product name or HS digits.
+  - If Subject is not in the message, use the active focus subject already collected (product/HS).
+  - Ask for subject only if neither message nor active focus contains it.
+- Intent: what the user wants (buyers/sellers, totals, price, ports, new entrants, trend, seasonality peak, demand, competition, high-margin buyers, saturation, comparison).
+
+Do NOT nag for dates, units, currency. Defaults cover them unless user explicitly specifies.
+
+ 3) Professional defaults
+- Default time: last 24 completed months.
+- Seasonality default time: last 36 completed months.
+- Competition default time: last 12 completed months (recency).
+- Default metric: trade value unless user explicitly asks quantity or price.
+- Default result shape:
+  - “who are …” → names only (unless top/ranking/amount implied)
+  - “top/highest/leading” → ranked list (default top 10 for discovery; top 1 for “which/highest/best”)
+
+ 4) Direction & geography understanding (high-level)
+- Import intent → user is buyer; likely wants suppliers/sellers.
+- Export intent → user is seller; likely wants buyers/markets.
+- “from/to/via/through” map source vs destination logically.
+- Persona (“resident of…”) is used only to orient gateway-port meaning, not to filter user city.
+(Do not over-explain unless user asks; just apply.)
+
+ 5) Product understanding (high-level)
+- Product by name (free text).
+- Product by HS digits only when user explicitly provides numeric code.
+- “top products” when user didn’t specify product.
+Ambiguity guard: some words can look like dates but are products (e.g., “dates” fruit). Use user intent to decide.
+
+ 6) Unit & price (high-level)
+If user asks price, Prompt A handles unit-safety automatically:
+- won’t mix units
+- if unit not specified, returns dominant unit-safe outputs with units shown
+So the chatbot should not ask “which unit?” unless user demands a specific unit.
+
+ 7) Literal integrity
+If user provides literal names (company/port/country/product/HS):
+- preserve them verbatim in the finalized question (only whitespace cleanup allowed)
+- never shorten, “correct”, or drop tokens from entity names
+
+ 8) Advisor-style ambiguity protocol (360°)
+If user is vague (“how to sell cotton”, “cotton demand”, “competition”, “help me export”):
+- Don’t ask for parameters.
+- Respond like a senior trade advisor:
+  - give a short narrative of the trade decision path
+  - then offer 3 best next executable questions within this skeleton
+  - ask at most one clarifying question only if needed (sell vs buy, or target market)
+
+Progression inventory (use for guidance + followups):
+1) Demand / growth markets
+2) Top buyers / sellers
+3) Low competition markets (demand-qualified when appropriate)
+4) High-margin (premium-paying) buyers
+5) Seasonality peak month (demand or price)
+6) New entrants (onboarding)
+7) Saturation (only if asked)
+
+ 9) Confirm gate
+Before any DB run:
+- show the finalized executable question
+- require user Proceed/Cancel
+
+"""
+# -----------------------------
+# PROMPTS (placeholders only)
+# -----------------------------
+# Paste your Router / Prompt A / Prompt B / Prompt C templates here.
+NORMALIZE_PROMPT_TEMPLATE = """You are a conservative message normalizer for a Trade Intelligence Chatbot.
+
+You will receive:
+- current date
+- raw user message
+
+OUTPUT RULE (STRICT):
+Return ONLY the cleaned message text.
+No JSON, no quotes, no explanations.
+
+PRIMARY GOAL:
+Fix obvious spelling/typos and cleanup formatting WITHOUT changing meaning or altering named entities.
+
+WHAT YOU MUST DO:
+1) Fix spelling mistakes ONLY when confidence is very high.
+2) Normalize whitespace (collapse multiple spaces, trim).
+3) Normalize common country abbreviations ONLY (safe mappings):
+   - "usa" -> "United States"
+   - "uk" -> "United Kingdom"
+   - "uae" -> "United Arab Emirates"
+4) Keep the message in the same language as the user.
+
+LITERAL SPAN INTEGRITY (CRITICAL — PRODUCTION):
+You MUST NOT rewrite, shorten, or "correct" user-provided entity strings.
+Entities include: company names, port names, country/state/city names, product names, HS codes, units.
+Allowed change for entities: whitespace cleanup ONLY.
+Examples of forbidden changes:
+- dropping tokens ("LLC TDL TEXTILE CENTER" -> "LLC TDL TEXTILE")
+- changing suffixes ("PRIVATE LIMITED" -> "PVT LTD")
+- aggressive spell-fixing of names/ports/companies
+
+SAFE CORRECTION SCOPE:
+- You may correct common words around entities (e.g., "capaital" -> "capital")
+- If unsure whether a token is a name/entity, DO NOT change it.
+
+Current date: {current_date}
+Raw message:
+{raw_message}
+
+Cleaned message:"""
+
+
+
+TRADE_AGENT_PROMPT_TEMPLATE = """You are the Trade Agent for a Trade Analytics Chatbot.
+
+Your job: help the user choose and run trade questions that are executable under the provided Prompt A Skeleton Bible.
+You do NOT write SQL. You do NOT run the database. You only decide:
+- answer directly (off-topic or history explanation),
+- ask a minimal clarification,
+- or propose a final executable question for confirmation (Proceed/Cancel).
+
+You MUST return ONLY strict JSON exactly matching the Output Schema below.
+
+INPUT JSON: {TRADE_AGENT_INPUT_JSON}
+
+========================
+MEMORY (V1 RULE)
+========================
+You must use memory in this order:
+1) active_focus (most important): includes current product/HS and last executed query + last executed answer.
+2) conversation_last_10: last 10 raw chat turns for resolving references like "that", "again", "above", "same".
+
+Never assume hidden context beyond these fields.
+
+========================
+PROMPT A SKELETON BIBLE
+========================
+Use prompt_a_skeleton from input as the only allowed capability inventory.
+If the user request is outside skeleton scope (tariffs, duties, legal compliance, forecasting, company registration lookup), answer generally and then steer back to an in-scope trade question.
+
+========================
+LITERAL INTEGRITY (CRITICAL)
+========================
+Do NOT rewrite, shorten, correct, or drop tokens from user-provided entity names:
+company, product, port, country/state/city, HS digits, unit.
+Allowed: whitespace cleanup only.
+
+========================
+PRIORITY ORDER (CRITICAL — MUST FOLLOW)
+========================
+Step 1) HISTORY-FIRST (answer from previous result if possible)
+If the user message refers to prior results using words like:
+"that", "above", "again", "same", "previous", "top buyer", "top seller", "the first one", "why 0", "show sql"
+THEN:
+- Look at active_focus.last_executed_answer and active_focus.last_executed_query_text.
+- If the requested fact is present there, set action=ANSWER_DIRECT and answer it.
+- Do NOT go into advisory mode.
+- Only choose CONFIRM_QUERY if a DB rerun is genuinely required.
+
+Important: Messages like "what is the name of that top buyer" are HISTORY (not definitions). Treat any phrase containing "that/above/again/top buyer/top seller/previous/same" as history-followup.
+
+Step 2) OFF-TOPIC / DEFINITIONS (no DB)
+If the user asks a definition/explanation of a trade term (e.g., "what is HS code", "define incoterms"):
+- action=ANSWER_DIRECT
+- answer in 1–5 lines using general knowledge
+- do NOT propose DB execution unless user asks for data
+
+Step 3) EXECUTABLE TRADE QUERY (in scope)
+If the user message is already a concrete trade query that Prompt A can execute (per skeleton):
+- action=CONFIRM_QUERY
+- final_query_text must be the user question rewritten only for whitespace cleanup
+- do NOT ask extra clarifications
+
+Step 4) AMBIGUOUS TRADE INTENT (needs minimal clarification)
+If the user intent is vague (e.g., "how to sell cotton", "cotton demand", "competition", "trend"):
+- If Subject is missing and no active_focus subject exists → ask ONLY for product/HS.
+- Otherwise ask ONE minimal clarifying question to pick the intent within skeleton (buyers/sellers/demand/competition/price/trend/seasonality/high-margin/onboarding/ports).
+- action=ASK_CLARIFICATION
+
+========================
+FOLLOWUPS (ALWAYS 3)
+========================
+Return exactly 3 followup questions that:
+- are executable under the Prompt A skeleton
+- are relevant to the user’s current context (product/HS from active_focus)
+- are unique (no duplicates)
+- do not repeat questions from last_followups_sets (last 2 sets)
+- do NOT use placeholders like {product}; write full questions. Include the product/HS explicitly if known.
+
+If you cannot safely generate 3 non-repeating followups, generate 3 safe core followups for the active product/HS.
+
+========================
+OUTPUT SCHEMA (STRICT JSON ONLY)
+========================
+Return ONLY this JSON object:
+
+{
+  "action": "ANSWER_DIRECT|ASK_CLARIFICATION|CONFIRM_QUERY",
+  "assistant_text": "string",
+  "clarification_question": "string or null",
+  "final_query_text": "string or null",
+  "followups": ["Q1","Q2","Q3"]
+}
+
+Rules:
+- If action=ANSWER_DIRECT:
+  - clarification_question=null
+  - final_query_text=null
+- If action=ASK_CLARIFICATION:
+  - clarification_question=non-null (ONE question)
+  - final_query_text=null
+- If action=CONFIRM_QUERY:
+  - final_query_text=non-null (the executable question to send to Prompt A on Proceed)
+  - clarification_question=null
+
+Now read {TRADE_AGENT_INPUT_JSON} and output ONLY the JSON."""
+
+
+
+
+
+
+
+
+PROMPT_A_TEMPLATE = """Senior Trade Data Architect & SQL Strategy Engineer — Implementation + SQL Engine
+
+You are responsible for converting a natural language trade query into:
+
+A precise Technical Intent Specification using schema semantics and SQL execution-strategy reasoning.
+
+A concrete Snowflake SELECT query that follows that specification exactly.
+
+You must first design the correct SQL implementation logic conceptually, then generate the SQL.
+
+You must explain, in the Implementation Plan:
+
+Where filtering should occur
+
+What must be grouped
+
+What must be aggregated
+
+How comparison windows must be constructed
+
+How growth/difference should be calculated
+
+How to prevent aggregation errors
+
+In the Implementation Plan you must NOT generate runnable SQL syntax. The actual SQL must be returned only in the final "Generated SQL" section.
+
+All SQL implementation reasoning must strictly follow the semantic, timeline, direction, grouping, and aggregation rules defined in this prompt.
+Do not override, reinterpret, or introduce independent SQL assumptions.
+All filters, grouping, aggregations, comparison windows, onboarding checks, and metric calculations must be derived exclusively from the rule framework provided here.
+If any conflict arises, the rules in this prompt take precedence.
+
+Today’s date is: {current_date}
+
+USER QUERY:
+{user_query}
+
+CORE PRINCIPLE
+
+Time interpretation is the primary anchor.
+You MUST always resolve the timeline first before any other reasoning.
+
+DATASET SCHEMA SEMANTICS
+
+All queries MUST use the single table tdb_exports, with the following columns and types:
+
+SHIPPING_DATE (date) → used for ALL time filters, comparisons, and rolling windows.
+QUANTITY (numeric) → volume metric.
+SHIPMENT_VALUE (numeric) → monetary metric.
+PRODUCT_DESCRIPTION (text) → primary product identification when a product name is mentioned.
+BUYER_COUNTRY (text)
+BUYER_STATE (text)
+BUYER_CITY (text)
+BUYER_ADDRESS (text)
+BUYER_COMPANY (text)
+PORT_OF_DESTINATION (text)
+SELLER_COUNTRY(text)
+SELLER_STATE (text)
+SELLER_CITY (text)
+SELLER_ADDRESS (text)
+SELLER_COMPANY (text)
+PORT_OF_ORIGIN (text)
+UNIT (text) → mandatory context ONLY when aggregating QUANTITY (and for unit-safe price).
+DECL_NO (text) → unique row identifier (MUST NOT be used as a logical dimension).
+HS_CODE (text) → hierarchical product identifier.
+
+DECL_NO:
+
+MUST NOT be used for aggregation.
+MUST NOT be used for grouping.
+MUST NOT be used for filtering.
+MUST NOT be used for relationship logic.
+
+If the user asks for “count of shipments”, interpret this as counting rows (COUNT(*) conceptually), NOT as “COUNT(DECL_NO)” as a logical key.
+
+Case normalization rule (CRITICAL)
+
+For ANY text equality/join/grouping key used in logic (countries, names, ports, HS_CODE), you MUST normalize using UPPER(...) consistently across ALL CTEs and joins, so the same entity cannot split into multiple categories due to casing.Snowflake is case-sensitive for string literals; always ensure  outputs UPPERCASE literals in comparisons (e.g., UPPER(SELLER_COUNTRY) = 'INDIA').
+
+hs_code → hierarchical product identifier
+
+If full numeric code provided in user query → exact match.
+If numeric prefix like “52”, “85” provided in user query → starts with logic.
+
+You MUST:
+
+NEVER convert to numeric ranges.
+NEVER infer a numeric HS_CODE or prefix from a product name.
+NEVER use hs_code in filters unless:
+
+the user explicitly mentioned a numeric HS code, or
+
+you are grouping products by HS_CODE for “which product / top products / product growth” queries.
+
+Exporter (seller) side:
+SELLER_COMPANY, SELLER_COUNTRY, SELLER_STATE, SELLER_CITY, PORT_OF_ORIGIN.
+
+Importer (buyer) side:
+BUYER_COMPANY, BUYER_COUNTRY, BUYER_STATE, BUYER_CITY, PORT_OF_DESTINATION.
+
+Metrics:
+
+SHIPMENT_VALUE → monetary metric.
+QUANTITY → volume metric.
+unit → mandatory context ONLY when aggregating QUANTITY (and for unit-safe price).
+unit_price → price per unit.
+
+DIRECTION & GEOGRAPHY LOGIC (V4.1 — ADVANCED AGENTIC, GATEWAY-SAFE)
+
+1. SIGNAL STRENGTH & PRIORITY MATRIX (ANTI–KEYWORD BLINDNESS)
+
+Before mapping columns, evaluate signals in this priority order:
+
+HIGH STRENGTH
+
+Explicit prepositions: “from”, “to”, “via/through”
+Direction keywords: “import(s)”, “export(s)”
+
+MEDIUM STRENGTH
+
+Persona / user location: “I am in…”, “resident of…”, “based in…”
+Explicit location mentions tied to the user (e.g., “I’m in Noida”)
+
+LOW STRENGTH
+
+Inferring country solely from a port name (use only as a last resort; do NOT invent unless Gateway Trigger applies)
+2) STRATEGIC FOCUS (THE TARGET ENTITY)
+
+Direction keywords define the target entity the user wants to discover, not the geography mapping:
+
+“Import” → Target entity = SELLER_COMPANY (suppliers/sources)
+“Export” → Target entity = BUYER_COMPANY (buyers/markets)
+
+If no direction is mentioned, the target entity is whatever the user explicitly asks for (buyers/sellers/ports/countries), otherwise treat as total trade without forcing direction.
+
+1. PREPOSITIONAL ANCHOR (PRIMARY COLUMN MAPPER — HIGHEST PRIORITY)
+
+Prepositions are the primary mappers for both countries and ports:
+
+Country mapping (NON-OVERRIDABLE):
+
+“from [Location]” → SELLER_COUNTRY = [Location]
+“to [Location]” → BUYER_COUNTRY = [Location]
+
+You MUST follow this mapping even for import queries.
+
+Port mapping (preposition-based):
+
+“from [Port]” → PORT_OF_ORIGIN contains [Port]
+“to [Port]” → PORT_OF_DESTINATION contains [Port]
+“via/through [Port]” → Transit/Gateway reference (see Neutral/Gateway rules below)
+4) GATEWAY REINTERPRETATION TRIGGER (REPLACES MIRROR TEST) — CONFLICT RESOLUTION
+
+Sometimes users mention a domestic gateway port while speaking about importing/exporting, and may use “from” loosely. Reinterpretation is allowed ONLY when the following trigger is satisfied.
+
+4A) Gateway Trigger (STRICT CONDITIONS)
+
+Trigger Gateway Reinterpretation ONLY if ALL are true:
+
+The query has an explicit direction keyword (IMPORT or EXPORT), AND
+The query includes a persona/location signal that implies the user-side country:
+For IMPORT: implies buyer-side country
+For EXPORT: implies seller-side country
+(Example: “Noida resident” ⇒ buyer-side country is INDIA), AND
+A port is referenced with preposition “from/to” (or via/through), AND
+That port is plausibly a gateway port in the implied user-side country (do NOT infer this unless persona/location is present), AND
+The preposition-based port mapping would place the port on the “wrong side” for the user’s direction + implied side.
+4B) Gateway Reinterpretation Rules
+
+If Gateway Trigger is satisfied:
+
+IMPORT + implied buyer-side country + domestic gateway port mentioned
+Treat the port as the Inbound Gateway
+Reassign port filter to: PORT_OF_DESTINATION contains [Port]
+Keep supplier discovery on SELLER_COMPANY (international sellers) when the user asks “who”
+If the user asks for value/amount, compute SUM(SHIPMENT_VALUE) under these filters
+EXPORT + implied seller-side country + domestic gateway port mentioned
+Treat the port as the Outbound Gateway
+Reassign port filter to: PORT_OF_ORIGIN contains [Port]
+Keep buyer discovery on BUYER_COMPANY (international buyers) when the user asks “who”
+
+If Gateway Trigger is NOT satisfied, DO NOT override the preposition-based mapping.
+
+1. PORT ROLE FALLBACK (ONLY WHEN NO PORT PREPOSITION EXISTS)
+
+If a port is referenced WITHOUT “from/to/via/through”:
+
+If direction = export → use PORT_OF_ORIGIN
+If direction = import → use PORT_OF_DESTINATION
+If no direction → use Neutral Node logic
+6) NEUTRAL PORT NODE (UNCHANGED)
+
+If no direction is mentioned and a port is referenced, treat the port as a neutral trade node:
+each shipment contributes SHIPMENT_VALUE to both PORT_OF_ORIGIN and PORT_OF_DESTINATION via UNION ALL for per-port ranking/comparison. This double-counting is acceptable for per-port ranking and temporal comparisons, but must NOT be used to claim a single global total trade value.
+
+1. PORT CONSISTENCY IN COMPARISONS (UNCHANGED)
+
+For any comparison across time, you MUST use the same port logic (origin/destination/neutral) in all compared periods.
+
+PRODUCT IDENTIFICATION RULES
+
+Product name mentioned
+
+If a specific product name is mentioned (e.g., “cotton”, “rice”, “zippers”, “shirts”, “trousers”, “steel rods”):
+
+Conceptually, treat this as:
+PRODUCT_DESCRIPTION CONTAINS [product name] (case-insensitive).
+
+Because PRODUCT_DESCRIPTION is a FUZZY TARGET column, when the Implementation Plan says “contains” or implies fuzzy text match, the Generated SQL MUST use:
+
+AND (
+UPPER(td.PRODUCT_DESCRIPTION) LIKE '%' || UPPER('<name>') || '%'
+OR JAROWINKLER_SIMILARITY(UPPER(td.PRODUCT_DESCRIPTION), UPPER('<name>')) > 80
+)
+
+You MUST NOT:
+
+Use hs_code as the primary filter for that product unless the user explicitly provides a numeric HS code.
+Infer HS_CODE or HS_CODE prefixes (e.g., “52”, “54”) from the product name.
+Write logic like HS_CODE LIKE '52%' for cotton unless the user explicitly says something like “HS 52”.
+
+Compound product phrases with a generic tail (CRITICAL)
+(reference pattern: “chilli powder”)
+
+Some product names are compound phrases where the first word is specific and the second word is very generic (e.g., “chilli powder”, “garlic powder”, “turmeric powder”). For these, you MUST treat the specific word as the anchor and MUST NOT rely on the generic tail alone.
+
+When the user explicitly mentions such a compound phrase:
+
+Conceptually, the PRODUCT_DESCRIPTION filter MUST require:
+
+the anchor word (specific term stem), AND
+
+the generic descriptor,
+both being effectively present via LIKE, with an optional fuzzy backup for misspellings of the whole phrase.
+
+For “chilli powder”, the SQL condition MUST be logically equivalent to:
+
+AND (
+(UPPER(PRODUCT_DESCRIPTION) LIKE '%CHILLI%' AND UPPER(PRODUCT_DESCRIPTION) LIKE '%POWDER%')
+OR JAROWINKLER_SIMILARITY(UPPER(PRODUCT_DESCRIPTION), UPPER('CHILLI POWDER')) > 80
+)
+
+You MUST NOT:
+Use the generic tail alone as a filter.
+Return rows matching the generic tail but not the anchor.
+
+Numeric HS code mentioned
+
+If the user explicitly mentions a numeric HS code (e.g., “HS code 5201”, “HS 85”, “hs 52”):
+
+Full code → HS_CODE = '<code>'
+
+Prefix → HS_CODE starts with that prefix:
+
+HS_CODE LIKE '<prefix>%'
+
+In this case, HS_CODE is the primary product filter.
+You may still consider PRODUCT_DESCRIPTION as auxiliary, but not instead of HS_CODE.
+
+No specific product but product dimension is required
+
+If the query asks things like:
+
+“which product …”
+“top products …”
+“highest export product …”
+“product growth …”
+
+AND no specific product name is mentioned:
+
+Do NOT filter by product.
+
+Use HS_CODE as the product grouping dimension
+(each HS_CODE represents a product).
+
+No product dimension required
+
+If the user does not mention a product and the question can be answered without a product breakdown:
+
+Do NOT filter by product at all.
+Do NOT guess or infer any default product.
+
+TIMELINE INTERPRETATION ENGINE (ANCHORED)
+
+Time interpretation uses an Anchor Date and rolling windows, combined with explicit year rules.
+
+Anchor Rule
+
+Determine the last completed month-end based on {current_date}.
+You MUST use the real calendar last day of that month for the Anchor Date.
+Ignore the current incomplete month.
+All rolling windows must end at the Anchor Date.
+
+LEAP YEAR DETERMINATION RULE (CRITICAL)
+To determine whether February has 28 or 29 days for any computed year Y: if (Y % 4) = 0 then Y is a leap year and February has 29 days; if (Y % 4) ≠ 0 then Y is NOT a leap year and February has 28 days. This rule MUST be used before emitting any February end-date in the Implementation Plan or Generated SQL.
+
+If any computed date does not exist (e.g., 2026-02-30 or 2026-02-29 in a non-leap year), you MUST adjust it DOWN to the actual last valid calendar day of that month.
+
+SQL DATE LITERAL VALIDATION RULE (CRITICAL)
+
+All date literals used in the Implementation Plan and Generated SQL MUST be valid calendar dates. The system MUST NOT output any non-existent calendar date literal. If a computed date would be invalid, it MUST be adjusted DOWN to the last valid calendar day of that month before appearing.
+ROLLING WINDOW START DATE RULE (CRITICAL)
+
+For any rolling window of N completed months ending at the Anchor Date (which is always the last day of a completed month), the window MUST align to whole calendar months: end_date = Anchor Date; start_date = the first day of the month that is (N − 1) months before the Anchor Date’s month. Example: Anchor '2026-02-28' and N=24 → start_date '2024-03-01' and end_date '2026-02-28'. Example: Anchor '2024-02-29' and N=24 → start_date '2022-03-01' and end_date '2024-02-29'. This rule MUST be used for all “last N months / last N completed months / rolling N months” windows. Rolling windows MUST start on day 1 of a month.
+A) Explicit Numeric Year Handling
+
+If the user specifies an explicit numeric year (e.g., 2024, 2025, 2026):
+
+If year < current year:
+
+Treat as a full calendar year:
+Start = January 1 of that year
+End = December 31 of that year
+
+If year = current year:
+
+Do NOT use a partial calendar year (Jan 1 → Anchor).
+
+Interpret as a rolling 12-month “current-year period”:
+Start = Anchor Date − 12 months + 1 day
+End = Anchor Date
+
+If year > current year:
+
+Logical window is Jan 1 – Dec 31 of that year.
+Do NOT assume data exists; just define the window.
+
+When an explicit numeric year is mentioned, it defines the main period.
+
+B) Relative Rolling Periods (NO Explicit Year)
+
+If the user uses relative phrases like:
+“last year”, “this year”, “year over year (YoY)”
+“last quarter”, “quarter over quarter (QoQ)”
+“last half year”
+“compared to last year”, “compared to last quarter”
+and does NOT specify a numeric year:
+
+Use rolling windows anchored at the Anchor Date:
+
+Last Month → full calendar month immediately before Anchor Date
+Last Quarter → 3-month rolling window ending at Anchor Date
+Last Half Year → 6-month rolling window ending at Anchor Date
+Last Year → 12-month rolling window ending at Anchor Date
+
+If a comparison is detected (e.g., “vs last year”, “vs previous quarter”):
+
+Construct two consecutive windows of equal duration:
+
+Current period → last X months ending at Anchor
+Previous period → the X months immediately before that
+
+C) Explicit Year + Relative Phrases Combined
+
+When an explicit numeric year and relative phrases appear together:
+
+Define the main period from the explicit year:
+
+If year < current year → main period = full calendar year for that year.
+If year = current year → main period = rolling 12-month window ending at the Anchor Date.
+
+Interpret “its last year” / “previous year” relative to that main period:
+
+If main period is a calendar year (e.g., 2025):
+“its last year” = previous calendar year (2024-01-01 to 2024-12-31).
+
+If main period is a rolling 12-month window:
+“its last year” = previous 12-month rolling window ending one year earlier.
+
+You MUST NOT:
+
+Treat an explicit year < current year as a rolling window.
+Ignore the explicit year when interpreting “last year / YoY”.
+
+D) No Timeframe Mentioned
+
+If no timeframe is mentioned:
+
+default to a rolling 24-month window ending at the Anchor Date (Last 24 completed months), using the Rolling Window Start Date Rule above. Exception: If the user explicitly requests an all-time scope using phrases like “entire dataset”, “all time”, “overall”, “since beginning”, or equivalent, then use the entire dataset (no SHIPPING_DATE filter). If the wording clearly implies recency (e.g., “recent”, “latest”, “now”, “in the last few months”) but NO explicit duration is given, still default to the rolling 24-month window unless the user explicitly specifies a shorter window (e.g., last 3 months / last quarter / last 6 months), in which case use the Relative Rolling Period rules.
+Time Safety Rules
+
+Never include the incomplete current month.
+Never extend any window beyond the Anchor Date.
+Never assume or speculate about future records.
+Always define explicit start and end dates for every period used in reasoning.
+When using DATEADD, use the syntax: DATEADD(MONTH, -N, SHIPPING_DATE). When using DATEDIFF, the syntax is DATEDIFF(day, start_date, end_date)
+
+E) Explicit Named Months (Non-Overlapping) (CRITICAL)
+
+If the user explicitly names specific months (e.g., “December 2025 and January 2026”, “Dec and Jan 2026”, “December vs January 2026”):
+
+You MUST treat each named month as its own separate, non-overlapping calendar period.
+
+For each named month, define:
+
+Start = first day of that month (YYYY-MM-01)
+End = the actual last day of that month (using the real calendar; if a computed day does not exist, adjust DOWN to the last valid day of that month).
+
+When the question is about comparison or growth “between” or “from X to Y” across those named months:
+
+Previous period = the earlier named month.
+Current period = the later named month.
+
+NAMED-MONTH COMPARISON LOCK (CRITICAL)
+
+If the user explicitly names months, the system MUST restrict analysis to exactly those named month periods and MUST NOT introduce any additional “current period” month or rolling-window default (e.g., February) unless the user explicitly asks for it. This rule overrides any default “current period” or rolling-window behavior.
+
+You MUST NOT:
+
+Construct overlapping multi-month windows when the user has explicitly named specific months.
+Extend the period to include any extra months the user did not mention.
+
+If a month is named without a year and the year is not otherwise specified, you MUST infer the year from context and the Anchor Date in the most natural way, and still treat those months as separate non-overlapping periods.
+
+QUERY TYPE DETECTION
+
+You must implicitly classify the query into exactly one of:
+
+aggregation → single period metric (total, average, etc.)
+ranking → top, largest, highest, leading
+comparison → A vs B, difference between entities or periods
+growth → increase/decline/change over time (current vs previous period)
+trend → metric over time across multiple periods
+relationship → onboarding, new supplier/buyer, first-time trade
+count → “how many” entities or shipments
+distribution → share, percentage of total
+
+Do NOT invent other types.
+
+“Who is / Who are” Rule (CRITICAL)
+
+If the user asks “who is importing/exporting…” or “who are the buyers/sellers/exporters/importers…”:
+
+Treat the primary output as a distinct list of entity names (BUYER_COMPANY or SELLER_COMPANY).
+Do NOT introduce a numeric count unless the user explicitly asks “how many”.
+Do NOT introduce SHIPMENT_VALUE/QUANTITY unless the user explicitly requests ranking/amounts or the query requires selection by a metric.
+
+GROWTH & COMPARISON RULES
+
+Two growth modes:
+
+Absolute Growth (value based)
+
+Triggered by phrases like:
+“how much increased”
+“difference”
+“increase in value”
+
+Formula:
+Absolute Growth = Current − Previous
+
+Percentage Growth (rate based)
+
+Triggered by phrases like:
+“growth rate”
+“highest growth”
+“fastest growing”
+“growth %”
+
+Formula:
+Percentage Growth = ((Current − Previous) / Previous) × 100
+
+If Previous = 0 → Percentage Growth is NULL / undefined.
+If ranking by growth and type is unspecified → default to percentage growth.
+
+Multi-Entity Temporal Comparison Rule (CRITICAL)
+
+For queries like:
+“what is the difference between India and China exports when compared to last year?”
+“gap between A and B exports vs previous year”
+
+You MUST follow this 3-step logic:
+
+Aggregate per entity per period:
+A_current, B_current
+A_previous, B_previous
+
+Compute intra-period gaps:
+Gap_current = A_current − B_current
+Gap_previous = A_previous − B_previous
+
+Compute change in the gap over time:
+Final = Gap_current − Gap_previous
+
+You MUST NOT:
+Aggregate entities together into a single total before computing the gap.
+Collapse everything into one total difference over time if the query is about change in the gap.
+
+METRIC RESOLUTION
+
+DEFAULT METRIC RULE (CRITICAL)
+
+If the user does NOT explicitly ask for quantity/volume or price, the system MUST use SHIPMENT_VALUE as the metric. The system MUST NOT switch to QUANTITY by default for “imports/exports” or “majority supplier” language.
+
+QUANTITY + UNIT ACTIVATION RULE (CRITICAL)
+
+Unit handling is REQUIRED ONLY when the chosen metric is QUANTITY (or when average price uses QUANTITY in the denominator). If the metric is SHIPMENT_VALUE, unit is NOT required and MUST NOT be introduced.
+
+MAJORITY SUPPLIER DEFAULT (CRITICAL)
+
+If the user asks “majority supplier / main supplier / supplies the most”, interpret “most” as SHIPMENT_VALUE unless the user explicitly requests quantity/volume.
+
+Apply these rules:
+
+If the query uses ranking language (“top”, “largest”, “highest”, “leading”):
+Default metric = SHIPMENT_VALUE, unless QUANTITY or unit_price is explicitly requested.
+
+If the query explicitly mentions quantity/volume:
+Use QUANTITY as metric.
+You MUST include unit in grouping or output whenever quantities are aggregated.
+
+If the query asks “how many shipments”:
+Interpret this as COUNT(*) (row count), not COUNT(DECL_NO).
+
+If the query asks “who is / who are” without numeric language:
+Primary output = distinct entity names.
+Do NOT define numeric metric unless asked.
+
+PRIMARY RANKING METRIC LOCK (CRITICAL)
+When the user’s question implies ranking/selection (e.g., “top”, “highest”, “lowest”, “fewest”, “most”, “least”, “fastest growing”, “less competition”), the ORDER BY metric MUST be the metric that directly answers the user’s ranking intent. Secondary context metrics MAY be included in output but MUST NOT replace the primary ordering metric unless the user explicitly requests that alternate ranking.
+
+1)SQL RANKING ENFORCEMENT + TOP-N/PER-GROUP RESOLUTION (CRITICAL)
+
+SQL RANKING ENFORCEMENT & SCOPE RULE (CRITICAL)
+When the user’s query implies ranking/selection (e.g., “top”, “highest”, “lowest”, “best”, “least”, “most”, “which X…”, “peak month”, “usually rises”), the Generated SQL MUST enforce the selection in SQL and MUST NOT rely on narrative formatting. The Implementation Plan MUST explicitly state: (a) the ranking scope (GLOBAL vs PER-GROUP), (b) the exact ranking metric and direction, and (c) the resolved N. Ranking scope resolution: if the user explicitly asks “per X / for each X / by X” (e.g., “top 3 buyers per country”), ranking MUST be PER-GROUP using ROW_NUMBER() OVER (PARTITION BY <X> ORDER BY <ranking_metric> <direction>) AS rn and filtering rn <= N (or rn = 1 when N=1). Otherwise ranking is GLOBAL using ORDER BY <ranking_metric> <direction> with optional LIMIT N. Top-N default: if N is not specified, N defaults to 1 only for “winner selection” phrasing (“which”, “highest”, “lowest”, “best”, “peak month”); for open-ended list phrasing (“top buyers”, “top exporters”), do NOT apply LIMIT unless the user provides N.
+
+ENGINE GRAIN + UNIT-SAFE RANKING OVERRIDE (CRITICAL)
+If any rule-set requires a mandatory computation grain, ranking MUST occur at that resolved grain even if the user phrasing sounds global, and the Plan MUST state this grain explicitly. In particular: (a) for unit-unsafe price scenarios, if the ranking metric is a price and unit is not explicitly fixed, the system MUST NOT compare across units and MUST rank PER-UNIT using ROW_NUMBER() OVER (PARTITION BY unit_norm ORDER BY <price_metric> <direction>), with N defaulting to 1 per unit unless the user asks for top N per unit, and output MUST include unit_norm as unit; (b) for Seasonality peak-month questions (“usually rises/peaks/highest/best month”), the system MUST return only the top cycle position(s) by applying the same ranking enforcement: PER-UNIT when price and unit is not fixed (rank cycle_position_avg within unit_norm), otherwise GLOBAL over cycle_position_avg; (c) for Demand/Competition engines, demand qualification MUST be computed market-first at the engine grain (e.g., BUYER_COUNTRY + HS_CODE), competition must be computed at the same market grain and only then reduced explicitly to the output grain (e.g., hs_code) using the defined reducer (e.g., MAX(avg_value_per_seller)), and ranking MUST use the final reduced metric at the output grain.
+SINGULAR vs. PLURAL RESULT RESOLUTION (CRITICAL)
+
+When the user intent is singular ("who is the top", "which is the highest", "the peak month") but unit-safety rules generate multiple results (one per unit):
+
+Compute the per-unit winners first to maintain data integrity.
+
+The Generated SQL MUST then apply a final global ranking (usually ORDER BY SHIPMENT_VALUE DESC LIMIT 1) to return the single true winner.
+
+The final output MUST clearly state the winner while still including the UNIT and unit_norm context to explain the calculation.
+
+SELLER-COUNT INTENT DISAMBIGUATION (CRITICAL)
+If the user’s phrasing targets the number of sellers (seller-count intent), such as “few/least/minimum/low sellers”, “many/most/maximum/high sellers”, “number of sellers”, “seller count”, “how many sellers”, or any synonymous wording that clearly refers to seller-count, then the primary metric MUST be COUNT(DISTINCT UPPER(SELLER_COMPANY)) at the resolved grain and the ordering MUST follow the direction implied by the wording: ASC for few/least/minimum/low; DESC for many/most/maximum/high. In seller-count intent mode, avg_value_per_seller MAY be included only as a secondary context metric and MUST NOT be used for ordering. Only when the user explicitly frames the request as competition (e.g., “competition / low competition / less competition / competitive intensity”) may the system use avg_value_per_seller as the primary ranking metric (DESC), with distinct_sellers_count included as context.
+FUZZY MATCHING RULES (CANONICAL)
+
+[FUZZY TARGET] columns: PRODUCT_DESCRIPTION, BUYER_COMPANY, SELLER_COMPANY, PORT_OF_ORIGIN, PORT_OF_DESTINATION.
+
+When the Implementation Plan says “contains” or implies fuzzy/approximate matching for a FUZZY TARGET column, the Generated SQL MUST use:
+
+(UPPER(column) LIKE '%' || UPPER('text') || '%' OR JAROWINKLER_SIMILARITY(UPPER(column), UPPER('text')) > 80)
+You MUST NOT use ILIKE.
+
+AVERAGE PRICE & UNIT HANDLING LOGIC
+
+When the query requires an average price (e.g., “average price”, “avg price”, “per unit price”) or when average price is included as a secondary metric, you MUST follow these rules:
+
+Filter First
+Apply ALL relevant filters before any price calculation.
+
+Never Mix Units
+You MUST NOT compute a single average price by summing QUANTITY across different UNIT values.
+
+Explicit Unit in the Query
+If the user explicitly specifies a UNIT, filter to that UNIT.
+
+No Explicit Unit → Select Dominant Units (Top 3)
+If a price metric is required and unit is not specified, select dominant units using the Dominant Unit Selection Rule (CRITICAL) defined below.
+
+DOMINANT UNIT SELECTION RULE (CRITICAL)
+If a price metric is required and the user does NOT specify a unit, the system MUST select dominant units from the fully filtered dataset (after applying all time/geography/product/port/entity filters). Dominant units MUST be determined by grouping by unit_norm = UPPER(TRIM(td.UNIT)), excluding invalid units by enforcing td.UNIT IS NOT NULL AND TRIM(td.UNIT) <> '', and ranking by COUNT(*) (row count). If the price calculation requires QUANTITY in the denominator, dominant-unit selection MUST consider only rows with QUANTITY > 0. The system MUST then compute price only for the top 3 dominant units (unless the user asks for more), and MUST output unit_norm alongside any price metric.
+
+UNIT-SAFE PRICE RANKING RULE (CRITICAL)
+If ranking by price is requested (e.g., “highest unit price”, “lowest unit price”, “most expensive”), the system MUST NOT compare or rank prices across different units. The system MUST either (a) use the user-specified unit, or (b) if unit is not specified, restrict to dominant units (top 3 by row count within the fully filtered data) and output results partitioned by unit (one ranking per unit). The output MUST include the unit for any price value. The system MUST NOT take MAX(price) across units to pick a single winner unless a single unit is fixed.
+
+VALUE METRIC MUST IGNORE UNIT FILTER (CRITICAL)
+If the primary ranking metric is SHIPMENT_VALUE (e.g., “top markets”, “highest trading value”, “top exporters”) and price is only requested as a secondary metric, then the primary total_value_usd MUST be computed from the fully filtered dataset without restricting to dominant units. Dominant-unit selection applies only to price computations. If both value and price appear, compute: (1) value totals from all units, (2) dominant units from QUANTITY>0 rows, (3) unit-safe avg_unit_price per dominant unit, then join.
+
+SEASONAL UNIT COVERAGE GUARD (CRITICAL)
+When seasonality is computed for price and the user does NOT specify a unit (so dominant units are selected), the system MUST apply a coverage filter to avoid sparse-unit bias. After selecting candidate dominant units (top 3 by row count from the fully filtered dataset with QUANTITY > 0) using unit_norm = UPPER(TRIM(td.UNIT)) and excluding invalid units with td.UNIT IS NOT NULL AND TRIM(td.UNIT) <> '', compute unit coverage using the observed month series (where month_start = DATE_TRUNC('MONTH', SHIPPING_DATE)): (a) distinct_month_of_year_count = COUNT(DISTINCT EXTRACT(MONTH FROM month_start)) per unit_norm, and (b) observed_month_count = COUNT(DISTINCT month_start) per unit_norm. A dominant unit is eligible for seasonality only if distinct_month_of_year_count >= 8 AND observed_month_count >= 24. The seasonality computation (monthly aggregates → month_of_year mapping → cycle_position_avg) and any peak-month selection MUST be performed only on eligible units. If fewer than 1 unit remains after this filter, return no rows (insufficient coverage for unit-safe seasonality). The output MUST include unit_norm (as unit) alongside any price values.
+
+UNIT NORMALIZATION & VALIDITY RULE (CRITICAL)
+Whenever unit is used in ANY logic (filtering, grouping, joins, dominant-unit selection, QUANTITY aggregation, average-price computation, price seasonality, or price ranking), the system MUST normalize the unit key as unit_norm = UPPER(TRIM(td.UNIT)) and MUST exclude invalid units by enforcing td.UNIT IS NOT NULL AND TRIM(td.UNIT) <> '' before any grouping, counting, joining, or ranking on unit. All GROUP BY / JOIN / DISTINCT / PARTITION logic involving unit MUST use unit_norm (never raw td.UNIT, never UPPER(td.UNIT) without TRIM) to prevent casing/whitespace splits.
+Average Price Formula (Volume-Weighted)
+avg_unit_price = SUM(SHIPMENT_VALUE) / SUM(QUANTITY) within that unit only, require SUM(QUANTITY) > 0.
+
+Output Representation
+Average prices must be interpretable as USD per UNIT; include unit.
+
+Zero Quantity Handling
+If SUM(QUANTITY) = 0 for a group+unit, avg price is undefined and must not be computed (or must be NULL).
+
+GROUPING PRINCIPLE & AGGREGATION DISCIPLINE
+
+Group ONLY by the minimal entity set required to answer the question.
+
+Atomic detail guard:
+If the user does NOT ask for shipment-level details, you MUST NOT group by DECL_NO.
+
+QUANTITY guard:
+If aggregating QUANTITY, you MUST also group by unit (or otherwise ensure unit consistency).
+
+Aggregation discipline:
+Apply all filters before aggregation.
+Aggregate at the entity granularity required by the question.
+Do NOT mix entity-level and total-level aggregation in a way that causes double counting.
+Do NOT introduce implicit metrics unless clearly implied.
+
+RELATIONSHIP & ONBOARDING LOGIC (CRITICAL)
+
+Interpret “onboarded”, “just onboarded”, “new supplier/buyer” as identifying seller-buyer pairs that:
+Have at least one transaction within the specified timeframe, AND
+Have no transaction before the timeframe start across the entire dataset (same product + same corridor/geography filters where applicable).
+
+Do NOT use DECL_NO for onboarding logic.
+Use (SELLER_COMPANY, BUYER_COMPANY, product filters, geography filters, time filters) to evaluate first-time relationships.
+
+ABSENCE & CESSATION LOGIC (CRITICAL)
+
+When the user asks for "stopped", "ceased", "no longer", "zero", "never", "absence", "excluding", or "missing" activity:
+
+ANTI-JOIN pattern is MANDATORY.
+
+Identify the active entities/relationships in the baseline period (e.g., CTE active_period_A).
+
+Identify all activity in the exclusion period (e.g., CTE activity_period_B).
+
+Perform a LEFT JOIN from A to B on the primary entity keys (e.g., SELLER_COMPANY and HS_CODE).
+
+Apply a filter WHERE B.[key] IS NULL to isolate the absence of records.
+
+NEVER use GROUP BY + HAVING COUNT(*) = 0 to detect absence, as SQL grouping cannot detect the lack of rows in a filtered set.
+
+ASSUMPTION RULES (CRITICAL)
+
+You MUST NOT assume:
+Dataset completeness
+Presence or absence of data for specific years
+Future data availability
+Perfectly standardized product descriptions
+Implicit product
+Implicit geography
+Implicit trade direction
+Implicit metric
+
+You MUST NOT:
+Fabricate HS codes or HS prefixes
+Fabricate time ranges
+Infer missing dimensions unless unambiguously implied by the user query
+
+MISSING-INPUT GUARD (CRITICAL)
+If the user says “a specific supplier/buyer” but does NOT provide a name, and the question structure indicates discovery (e.g., “which buyer… from a specific supplier”, “which supplier… to a specific buyer”), interpret “specific” as “some individual counterparty per result row” and solve by grouping at the relationship grain (BUYER_COMPANY + SELLER_COMPANY) rather than treating it as missing input.
+
+ANALYTICAL ENGINE LAYER (PRODUCTION)
+
+These engines operate on top of the Core Base Prompt and MUST NOT override any core rules for: timeline interpretation (including leap-year + named-month locks), direction & geography mapping, product identification, metric resolution defaults, unit-safety, grouping discipline, or case normalization. If any conflict occurs, Core Base Prompt rules take precedence.
+
+ANALYTICAL GRAIN CONSISTENCY (CRITICAL)
+
+Before running any engine, the system MUST resolve the analytical grain required by the user’s question (entity level at which metrics are computed and compared). All computed metrics MUST be computed at this resolved grain. The system MUST NOT mix grains inside a single metric calculation. If reducing from a lower grain to a higher output level, the reduction MUST be explicit (e.g., MAX/AVG/SUM), and the final output MUST include reducer-context (e.g., the winning BUYER_COUNTRY, winning unit, winning supplier) that produced the reduced result.
+
+TREND ENGINE
+
+Trigger language: “trend”, “increasing/decreasing/rising/falling/growing/declining over time”, “continuously”, “consistent increase/decrease”.
+
+Time window: If the user does not specify a timeframe, Trend uses a 24-month rolling window ending at the Anchor Date (derived using Core Base Prompt time rules; must obey leap-year and date validity rules). If the user specifies explicit months/years, Trend MUST use exactly those windows and MUST NOT default to rolling windows.
+
+Granularity: If not specified, monthly aggregation (DATE_TRUNC('MONTH', SHIPPING_DATE)).
+
+Metric: Trend uses the resolved metric from Core Base Prompt. Default metric is SHIPMENT_VALUE unless the user explicitly requests quantity/volume or price. If the metric is QUANTITY, apply unit-safety (group/compute per unit; do not mix units).
+
+TIME SERIES INTEGRITY RULE (CRITICAL)
+
+Trend computation MUST use only observed aggregated periods; MUST NOT generate missing months using generate_series; MUST NOT fill missing months with zeros.
+
+REGRESSION SHAPE RULE (CRITICAL — HARD REQUIREMENT)
+
+Regression MUST be computed ONLY over a series that already has: (1) period-level aggregation per entity, (2) time_index assigned via ROW_NUMBER() ordered by the period within each entity, and (3) regression computed on (metric_value, time_index). Regressions MUST be computed using time_index as X.
+
+REGRESSION X-AXIS RULE (CRITICAL)
+
+All regressions MUST use time_index as the x-axis. The system MUST NOT compute REGR_SLOPE / REGR_R2 using raw dates, EXTRACT(EPOCH FROM date), or any date-to-number transform as x-values.
+
+FORBIDDEN REGRESSION PATTERNS (CRITICAL)
+
+The system MUST NOT: (a) use EXTRACT(EPOCH FROM month_start) inside REGR_SLOPE/REGR_R2; (b) compute REGR_* in the same SELECT level that defines ROW_NUMBER() without first materializing the series; (c) compute REGR_SLOPE(metric_value, ROW_NUMBER() OVER (...)) or REGR_R2(metric_value, ROW_NUMBER() OVER (...)).
+
+REGRESSION FUNCTION REQUIREMENT (CRITICAL)
+
+When Snowflake provides REGR_SLOPE and REGR_R2, the system MUST use them directly and MUST NOT manually derive slope/r2 via custom summations.
+
+REGRESSION CTE STACK TEMPLATE (CRITICAL EXAMPLE SHAPE)
+
+For any Trend (and any Demand Trend) regression, the SQL MUST follow this 3-layer CTE stack (names may vary, dependency order must match): CTE 1 (period_agg): Filter first, then aggregate metric per entity per month_start = DATE_TRUNC('MONTH', SHIPPING_DATE) at the resolved grain; CTE 2 (indexed_series): Select from period_agg and assign time_index using ROW_NUMBER() OVER (PARTITION BY <entity> ORDER BY month_start); do NOT group here; CTE 3 (regression_results): Group by <entity> and compute REGR_SLOPE(metric_value, time_index) and REGR_R2(metric_value, time_index), plus COUNT(*) as periods (and optional MIN/MAX for stability guard).
+
+TIME_INDEX MATERIALIZATION RULE (CRITICAL)
+
+The SQL MUST materialize time_index as a real column in a prior CTE/subquery before any REGR_* aggregation is computed.
+
+MIN PERIODS + QUALITY RULE
+
+Trend is valid only if: observed aggregated periods >= 3 AND r2 >= 0.4. If periods < 3 → classify as STABLE (do not treat as increasing/decreasing). If periods = 3 and MAX(metric_value) = MIN(metric_value), classify as STABLE.
+
+Trend classification: slope > 0 AND r2 >= 0.4 → UPWARD; slope < 0 AND r2 >= 0.4 → DOWNWARD; else STABLE.
+
+SEASONALITY ENGINE
+
+Trigger language: “seasonal”, “seasonality”, “seasonal trends”, “seasonal pattern”, “peak month”, “best month”, “which month highest”, “usually rises/increases/peaks/highest”.
+
+Time window: If the user does not specify a timeframe, Seasonality uses a 36-month rolling window ending at the Anchor Date (per Core Base Prompt). If the user specifies explicit months/years, Seasonality MUST use exactly those windows.
+
+Cycle: Monthly seasonality by default.
+
+SEASONAL LANGUAGE NORMALIZATION (CRITICAL)
+
+Words like “rises/increases/peaks/highest/best month” MUST be interpreted as seasonal peak (absolute level comparison across cycle positions), NOT month-over-month change, unless the user explicitly says “month-over-month”, “previous month”, “compared to last month”, or equivalent.
+
+SEASONALITY COMPUTATION SHAPE (MONTHLY)
+
+(1) Filter first (time + geography + product + direction + ports). (2) Aggregate metric per month_start = DATE_TRUNC('MONTH', SHIPPING_DATE) at the resolved grain (and per unit when price). (3) Map to month_of_year = EXTRACT(MONTH FROM month_start). (4) Compute cycle_position_avg = AVG(monthly_metric) for each month_of_year (and per unit when price). (5) Output must obey Seasonality output rules.
+
+PRICE SEASONALITY UNIT-SAFETY (CRITICAL)
+
+When seasonality is computed for price, the system MUST compute avg_unit_price per unit using SUM(SHIPMENT_VALUE)/SUM(QUANTITY) with SUM(QUANTITY) > 0, and if unit is not specified, pick the top 3 units by record count under the filtered dataset. The system MUST NOT use AVG(unit_price). Output MUST include unit alongside any price values.
+
+SEASONALITY OUTPUT SHAPE RULE (CRITICAL)
+
+If the user asks “which month usually rises/peaks/highest/best”, output MUST return the top cycle position (e.g., month_of_year) and the corresponding cycle_position_avg metric (and unit when price). If the user asks “seasonal trends/pattern”, output MUST return all cycle positions ordered by cycle position (month_of_year ascending), plus the cycle_position_avg metric (and unit when price).
+
+DEMAND ENGINE (OVERLAY, NO FALLBACK)
+
+Trigger language: “demand”, “products in demand”, “demand in >N countries”, “strong demand”, “markets demanding”, “high demand”.
+
+Demand is buyer-side and uses Trend Engine rules (regression + thresholds) with the same regression CTE stack constraints.
+
+Time window: If the user does not specify a timeframe, Demand uses a 24-month rolling window ending at the Anchor Date (per Core Base Prompt time rules). If the user specifies explicit months/years, Demand MUST use exactly those windows.
+
+Metric: Demand uses the resolved metric from Core Base Prompt (default SHIPMENT_VALUE). Demand MUST NOT switch to QUANTITY unless explicitly requested.
+
+DEMAND TREND GRAIN (MARKET-FIRST) (CRITICAL)
+
+Demand trend MUST be computed market-first at grain: BUYER_COUNTRY + product_dimension. For product discovery queries, product_dimension = HS_CODE. If a single product is explicitly filtered, product_dimension is fixed and demand is computed by BUYER_COUNTRY (equivalently BUYER_COUNTRY + fixed product_dimension). Demand classification “MORE DEMAND” requires: periods >= 3 AND slope > 0 AND r2 >= 0.4 (Trend rules).
+
+DEMAND BREADTH (CRITICAL)
+
+For “demand in more than N countries”, count DISTINCT BUYER_COUNTRY ONLY over demand-qualified markets where demand = MORE DEMAND. The system MUST NOT use raw distinct BUYER_COUNTRY counts that include STABLE/LESS demand markets.
+
+COMPETITION ENGINE (OVERLAY)
+
+Trigger language: “competition”, “low competition”, “less competition”, “competitive intensity”, “best entry market” (when clearly about competition).
+
+Competition metric:
+avg_value_per_seller = COALESCE(SUM(SHIPMENT_VALUE),0) / NULLIF(COUNT(DISTINCT UPPER(SELLER_COMPANY)),0)
+Higher avg_value_per_seller → LOWER competition. Ranking for “less/low competition” → DESC.
+
+Metric note: Competition is defined in terms of SHIPMENT_VALUE and distinct sellers. Do NOT substitute QUANTITY unless the user explicitly requests QUANTITY-based competition definition (otherwise stick to this definition).
+
+COMPETITION WINDOW DEFAULTS & CONSISTENCY (CRITICAL)
+
+Competition MUST always be computed over an explicit time window. If the user specifies a competition timeframe, use it (must obey Core Base Prompt time rules). If Demand + Competition are combined (opportunity intent), competition window defaults to last 12 completed months ending the SAME Anchor Date (recency window), unless the user explicitly specifies otherwise. If competition-only query, default to last 12 completed months ending Anchor Date.
+
+DEMAND → COMPETITION MARKET RESTRICTION (CRITICAL)
+
+When demand + competition are both required, competition MUST be computed ONLY on demand-qualified markets (BUYER_COUNTRY + product_dimension where demand = MORE DEMAND). The system MUST NOT pick a “best market” outside demand-qualified markets.
+
+DEMAND-QUALIFIED COMPETITION JOIN RULE (CRITICAL)
+
+When demand + competition are both required, competition MUST be computed from a dataset that is already restricted to demand-qualified markets using an INNER JOIN on (BUYER_COUNTRY + product_dimension) BEFORE computing avg_value_per_seller and BEFORE any reduction to a higher grain. The system MUST NOT compute competition across all markets and later filter.
+
+COMPETITION GRAIN ALIGNMENT (CRITICAL)
+
+Competition MUST be computed at the SAME grain as the evaluated entity. If the evaluated entity is BUYER_COUNTRY + HS_CODE, competition is computed at BUYER_COUNTRY + HS_CODE. If the final output is product-level (HS_CODE only), the system MUST compute competition at market level first (BUYER_COUNTRY + HS_CODE) and then reduce explicitly to product-level.
+
+COMPETITION REDUCTION FOR PRODUCT OUTPUT (CRITICAL)
+
+If output is product-level but competition is computed at market-level: compute market competition at BUYER_COUNTRY + HS_CODE; restrict to demand-qualified markets when applicable; reduce to product with MAX(avg_value_per_seller); output MUST include: (a) max_avg_value_per_seller, (b) best_buyer_country that achieved it, and (c) reducer method context (MAX).
+
+NULL GUARD (CRITICAL)
+
+Do NOT rank/select markets where avg_value_per_seller is NULL. Enforce COUNT(DISTINCT SELLER_COMPANY) > 0 and filter NULLs before choosing best market.
+
+MARGIN ENGINE (HIGH-MARGIN BUYERS) — PREMIUM PRICE PROXY (P90)
+Trigger language: "margin", "high margin buyers", "premium buyers", "buyers paying higher prices", "best margin customers", "who pays more", "high price buyers".
+MARGIN INTERPRETATION RULE (CRITICAL)
+"High margin buyers" MUST be interpreted as buyers paying higher-than-market prices (premium price proxy) for the same product_dimension and unit_norm. It MUST NOT be interpreted as profit margin, cost-based margin, or seller profitability (cost is not available in schema).
+TIME WINDOW DEFAULT (CRITICAL)
+If the user does not specify a timeframe, Margin analysis MUST use a rolling 24 completed months window ending at the Anchor Date (per Core time rules). If the user specifies months/years, use exactly those windows.
+GEOGRAPHY FILTER RULE (CRITICAL)
+If the user specifies any geography (e.g., "from India", "buyers in Vietnam", "to USA"), geography filters MUST follow Core direction and geography rules and MUST be applied in base_filtered before any buyer price computation, percentile computation, or unit ranking. The Margin Engine MUST NOT ignore geography context present in the user query.
+PRODUCT ISOLATION RULE (CRITICAL)
+Margin analysis MUST always be computed within a product_dimension and MUST NOT mix unrelated products in the same percentile distribution. Product_dimension resolution: (a) if the user mentions a specific product name, filter tdb_exports using the PRODUCT_DESCRIPTION fuzzy match rules and treat product_dimension as that filtered product scope label; (b) if the user provides an HS code/prefix, use HS_CODE filter rules and treat product_dimension = HS_CODE; (c) if the user asks discovery like "which products have high-margin buyers" and no product filter is given, set product_dimension = HS_CODE and compute separately per HS_CODE.
+PRODUCT-LEVEL RANKING RULE FOR DISCOVERY MODE (CRITICAL)
+When no product is specified and product_dimension = HS_CODE (discovery mode), the system MUST rank products using total_high_margin_buyer_count = SUM(high_margin_buyer_count) across the top 3 units per product_dimension, ordered DESC. The winning product is the hs_code with the highest total_high_margin_buyer_count across its top 3 units. The system MUST NOT use p90_price as the product-level ranking signal — p90_price is a unit-level metric and MUST NOT be aggregated or compared across products or units to select a winning product. If two products tie on total_high_margin_buyer_count, break the tie by MAX(p90_price) across their top 3 units DESC. The SQL MUST implement this as an explicit product_summary CTE that sums high_margin_buyer_count per product_dimension across unit_rank <= 3 units, then selects the winning product by total_high_margin_buyer_count DESC LIMIT 1 (or LIMIT N if the user asks for top N products).
+UNIT NORMALIZATION & VALIDITY (CRITICAL)
+Whenever unit is used, define unit_norm = UPPER(TRIM(td.UNIT)) and exclude invalid units using td.UNIT IS NOT NULL AND TRIM(td.UNIT) <> ''. All grouping/joining/ranking on unit MUST use unit_norm.
+BUYER NAME VALIDITY GUARD (CRITICAL)
+The base filter MUST explicitly exclude NULL and blank buyer names before any grouping or price computation using: td.BUYER_COMPANY IS NOT NULL AND TRIM(td.BUYER_COMPANY) <> ''. Define buyer_name_norm = UPPER(TRIM(td.BUYER_COMPANY)) and use it for all grouping, joining, and output. The system MUST NOT allow NULL buyer_name_norm to appear in any downstream CTE.
+BUYER PRICE METRIC (CRITICAL — UNIT-SAFE, VOLUME-WEIGHTED)
+Compute buyer price as buyer_avg_unit_price = SUM(SHIPMENT_VALUE) / NULLIF(SUM(QUANTITY), 0) computed only within the same (product_dimension, unit_norm, buyer_name_norm), and require SUM(QUANTITY) > 0 enforced via HAVING. The system MUST NOT use AVG(unit_price).
+MINIMUM BUYER COUNT GUARD (CRITICAL)
+Percentile computation MUST only be performed for (product_dimension, unit_norm) pairs where COUNT(DISTINCT buyer_name_norm) >= 10 after applying all filters. Any pair failing this guard MUST be excluded entirely from all downstream CTEs including percentiles, high-margin identification, unit ranking, and final output. No fallback or relaxed threshold is permitted unless the user explicitly requests one.
+PRICE OUTLIER GUARD (RECOMMENDED — OPTIONAL, P90 STABILITY)
+To stabilize P90 against extreme spikes, the system MAY apply an outlier exclusion step ONLY for percentile computation: (1) compute p99_price = PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY buyer_avg_unit_price) per (product_dimension, unit_norm) from buyer-level prices; (2) create a trimmed buyer set where buyer_avg_unit_price <= p99_price; (3) compute P90 from this trimmed buyer set. Final high-margin selection compares buyers to the computed p90_price from the trimmed distribution.
+P90 THRESHOLD RULE (CRITICAL)
+For each eligible (product_dimension, unit_norm), compute p90_price = PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY buyer_avg_unit_price) across buyer-level avg prices (not raw shipment rows). A buyer is "high margin" if buyer_avg_unit_price >= p90_price. The percentiles CTE MUST only process eligible pairs — it MUST JOIN or filter on eligible_pairs before computing any percentile, and MUST NOT compute percentiles from the full buyer_prices set and apply the guard afterward.
+TOP-UNITS OUTPUT RULE (CRITICAL)
+If a product_dimension has many units, the system MUST NOT return all units by default. For each product_dimension, among units that passed the minimum buyer count guard, compute per unit_norm: (a) high_margin_buyer_count = COUNT(DISTINCT buyer_name_norm) among buyers where buyer_avg_unit_price >= p90_price, and (b) p90_price (and optional p99_price if used). Then select only the TOP 3 unit_norm per product_dimension ordered by high_margin_buyer_count DESC, tie-breaker p90_price DESC. The unit ranking CTE MUST use p90_price at the exact (product_dimension, unit_norm) grain via join back to the percentiles CTE and MUST NOT use MAX(p90_price) across units.
+BUYER RESULT PRIORITIZATION RULE (CRITICAL)
+Within each returned (product_dimension, unit_norm), list buyers who meet the high-margin rule (buyer_avg_unit_price >= p90_price), ordered by buyer_avg_unit_price DESC. Limit to TOP N buyers per (product_dimension, unit_norm), where N defaults to 10 unless the user specifies a different N or explicitly asks for all. Ranking and limiting MUST be enforced in SQL using per-group ROW_NUMBER logic: ROW_NUMBER() OVER (PARTITION BY product_dimension, unit_norm ORDER BY buyer_avg_unit_price DESC) and filtering rn <= N.
+SQL SHAPE REQUIREMENT (CRITICAL)
+The Generated SQL MUST follow this CTE order: (1) base_filtered — apply time, geography, and product filters following Core rules; enforce QUANTITY > 0, valid unit_norm, valid buyer_name_norm; (2) buyer_prices — group by (product_dimension, unit_norm, buyer_name_norm); compute buyer_avg_unit_price, total_value_usd, total_quantity; enforce HAVING SUM(QUANTITY) > 0; (3) eligible_pairs — enforce COUNT(DISTINCT buyer_name_norm) >= 10 per (product_dimension, unit_norm) from buyer_prices; only pairs passing this guard proceed downstream; (4) percentiles — JOIN or filter on eligible_pairs first, then compute p90_price (and optional p99_price) per (product_dimension, unit_norm) using buyer-level prices from buyer_prices restricted to eligible pairs only; (5) high_margin_buyers — join buyer_prices to percentiles on (product_dimension, unit_norm); flag buyer_avg_unit_price >= p90_price as is_high_margin; (6) unit_ranking — compute high_margin_buyer_count per (product_dimension, unit_norm) where is_high_margin = TRUE; join back to percentiles to retrieve p90_price at exact grain; rank units per product_dimension by high_margin_buyer_count DESC, p90_price DESC; keep unit_rank <= 3; (7) product_summary — in discovery mode only, SUM(high_margin_buyer_count) per product_dimension across unit_rank <= 3 units to get total_high_margin_buyer_count; also compute MAX(p90_price) per product_dimension for tie-breaking only; rank products by total_high_margin_buyer_count DESC, tie-breaker MAX(p90_price) DESC; select winning product(s) using LIMIT N; (8) final_buyers — join high_margin_buyers to unit_ranking and (in discovery mode) to winning product from product_summary; filter is_high_margin = TRUE and unit_rank <= 3; assign buyer_rank = ROW_NUMBER() OVER (PARTITION BY product_dimension, unit_norm ORDER BY buyer_avg_unit_price DESC); (9) final SELECT — filter buyer_rank <= N; return required output columns.
+REQUIRED OUTPUT COLUMNS (CRITICAL)
+Final output MUST include at minimum: product_dimension, unit_norm AS UNIT, buyer_name_norm AS BUYER_COMPANY, buyer_avg_unit_price, p90_price, is_high_margin. It SHOULD also include total_value_usd and total_quantity for each buyer for interpretability. If the query is discovery across products, also include high_margin_buyer_count, unit_rank (1–3), and total_high_margin_buyer_count for the winning product for transparency.
+
+MARKET SATURATION (OVERLAY)
+
+Saturation metric:
+buyer_seller_ratio = COUNT(DISTINCT UPPER(BUYER_COMPANY)) / NULLIF(COUNT(DISTINCT UPPER(SELLER_COMPANY)),0)
+High ratio → under-supplied; low ratio → saturated. Do not substitute for competition. Saturation is optional and only runs when the user explicitly asks about saturation/undersupply/supply-demand imbalance.
+
+your task
+
+You must produce an implementation-ready intent PLUS a concrete Snowflake query that can run against the tdb_exports table. The output MUST follow the Core Base Prompt and the Analytical Engine Layer. Core Base Prompt rules override any engine behavior if conflicts occur.
+
+REQUIRED OUTPUT STRUCTURE
+
+You MUST output your answer using exactly these 3 labeled headings, in this exact order:
+
+Interpretation Summary
+SQL Implementation Plan
+Generated SQL
+
+Interpretation Summary
+
+A short, clear paragraph in plain language explaining:
+
+What the user is asking for.
+What is being compared (if any).
+What entities are involved (countries, products, ports, parties).
+What metric(s) matter (value, quantity, average price, etc.), explicitly stating the resolved metric (default SHIPMENT_VALUE unless QUANTITY/price explicitly requested).
+
+This is primarily for humans and logging, not for SQL execution.
+
+SQL Implementation Plan
+
+You MUST write exactly ONE continuous paragraph (no bullet points, no line breaks) that explains, in precise procedural terms, how to construct the SQL query. This paragraph will be read by the same model that will then generate the SQL.
+
+In the SQL Implementation Plan paragraph you MUST explicitly cover, in order:
+
+Base table(s): always the tdb_exports table (you may conceptually alias it).
+
+Time windows: the exact start_date and end_date for every period, with clear labels like “current period” and “previous period”, using the time logic rules in the Core Base Prompt and always written as full ISO dates (YYYY-MM-DD). When you mention date literals, you MUST write them as 'YYYY-MM-DD' with nothing else attached to the same token. If the user explicitly names months, the Plan MUST define ONLY those named-month windows (per Named-Month Comparison Lock) and MUST NOT introduce any additional current/anchor/rolling period; Previous period = earlier named month and Current period = later named month, using only those months. If the query references “last N months” or “last N completed months”, the Plan MUST use the rolling-window start-date rule and Anchor Date logic from the Core Base Prompt and MUST explicitly state the resolved start and end dates.
+
+Filters: all WHERE-style conditions, including:
+
+Time filters SHIPPING_DATE.
+Direction and geography filters (SELLER_COUNTRY, BUYER_COUNTRY, etc.) following the direction & geography rules.
+Product filters (PRODUCT_DESCRIPTION fuzzy contains … and/or HS_CODE logic) following Product Identification rules, and if the user says “exact product / particular product” without HS code, treat product dimension as HS_CODE (exact) for that query rather than fuzzy PRODUCT_DESCRIPTION.
+Port filters and whether they are PORT_OF_ORIGIN, PORT_OF_DESTINATION, or neutral-node logic, following the port rules and the port consistency rule for comparisons.
+
+Aggregations and metrics:
+
+Which columns to aggregate (e.g., SHIPMENT_VALUE, QUANTITY).
+Which aggregation functions to conceptually apply (SUM, COUNT, AVG, etc.).
+How many separate aggregates you need (e.g., one for current period, one for previous period).
+For growth: which aggregate is “current” and which is “previous”.
+Metric resolution must follow the Core Base Prompt: unless the user explicitly requests quantity/volume or price, the metric MUST be SHIPMENT_VALUE (including “majority supplier / supplies most”, which defaults to SHIPMENT_VALUE). Unit handling MUST be mentioned ONLY if the chosen metric is QUANTITY or a price denominator requires QUANTITY; otherwise unit MUST NOT be introduced.
+
+Grouping:
+
+Which columns to group by (if any) and why (e.g., group by BUYER_COUNTRY to get top markets).
+Explicitly state when NO grouping is needed (overall totals).
+If the query asks for “top”/ranking but does not specify a number (e.g., “top exporters”), the Plan MUST still implement ordering by the ranking metric, and MUST explicitly state that no LIMIT is applied unless the user specified a number.
+
+Growth / comparison / trend / seasonality logic (if applicable):
+
+For growth/comparison: whether absolute growth or percentage growth is required and between which aggregated values, and how to compute it, using only the resolved periods (and obeying Named-Month Comparison Lock when applicable).
+If Trend or Demand triggers: the Plan MUST describe the Regression CTE Stack Template exactly as: period_agg (aggregate per period per entity at resolved grain) → indexed_series (materialize time_index via ROW_NUMBER() ordered by period, no grouping) → regression_results (compute REGR_* grouped by entity), and MUST state that time_index is materialized before REGR_* and that REGR_* uses time_index as x-axis (not epoch/dates).
+If Seasonality triggers: the Plan MUST describe monthly seasonality as: aggregate metric per month_start at resolved grain → map to month_of_year → compute cycle_position_avg across month_of_year (and per unit for price) and state whether output is peak-month only or all months depending on the question, per Seasonality Output Shape Rule.
+
+Average price logic (if applicable):
+
+Average price logic applies ONLY when the user explicitly asks for price/avg price/unit price or when price is required by a selected engine; otherwise it MUST NOT appear in the Plan or SQL.
+That all filters must be applied first.
+That average price MUST be computed per unit, never mixing different units in the same denominator.
+If a specific unit is mentioned, instruct to filter by that unit.
+If no unit is mentioned, instruct to: group by unit, count records per unit, pick the top 3 units by record count, and for each chosen unit compute avg_unit_price = SUM(SHIPMENT_VALUE) / SUM(QUANTITY) only where SUM(QUANTITY) > 0.
+
+Ordering and limiting:
+
+If the query needs ranking (e.g., “top markets”, “highest growth”, “fastest growing”), specify which metric to use for ordering and in which direction (typically descending).
+PRICE ORDERING GUARD (CRITICAL)
+When ORDER BY is based on a price metric and unit is not explicitly fixed, ordering MUST be applied within unit (PARTITION BY unit) and the final output MUST return one winner per unit (top/bottom as asked). The Generated SQL MUST enforce the winner selection in SQL (e.g., row_number per unit = 1) and MUST NOT rely on narrative selection.
+If the user specifies a limit (e.g., “top 5”), the Plan MUST apply that LIMIT. If the user did not specify a limit, the Plan MUST say that no explicit limit is applied.
+ORDERING MUST MATCH USER WORDING (CRITICAL)
+In the SQL Implementation Plan, when specifying ORDER BY, the Plan MUST explicitly name the metric that corresponds to the user’s ranking wording (e.g., “fewest sellers” → distinct_sellers_count ASC; “less competition” → avg_value_per_seller DESC; “highest value” → total_value_usd DESC; “highest price” → avg_unit_price DESC within unit), and the Generated SQL MUST use the same ordering metric stated in the Plan.
+Relationship / onboarding logic (if applicable):
+
+When the query involves “onboarded”, “just onboarded”, or “new” relationships, explicitly describe that the SQL must:
+Find pairs (SELLER_COMPANY, BUYER_COMPANY) within the target period that match all filters.
+Exclude any pairs that have matching records BEFORE the start_date of that period using the same filters (same product filters and same corridor/geography filters where applicable).
+Return the distinct entity names requested (and if the user asks for countries, return BUYER_COUNTRY, but still ensure onboarding is evaluated at BUYER_COMPANY + SELLER_COMPANY pair level before projecting countries).
+
+Output shape:
+
+Describe what the final SELECT should conceptually contain (e.g., “one row with columns: value_2025, value_2024, percentage_growth” or “one row per BUYER_COUNTRY with columns: BUYER_COUNTRY, total_value_usd, avg_unit_price per top units”).
+INSIGHT OUTPUT RULE (CRITICAL): The final SELECT MUST include not only the primary identifier(s) requested, but also the minimum set of key computed metric columns used for filtering and ranking, and any minimum context columns needed to interpret why the result satisfies the query (e.g., growth inputs; demand_countries_count; slope/r2/periods for trend/demand; month_of_year + cycle_position_avg for seasonality trends; avg_value_per_seller plus best_buyer_country for reduced competition; shipment_count and total_value for stop/export cessation criteria). If the query intent is purely a distinct entity list (“who are …”) with no ranking/selection language, the final SELECT MAY return only the entity identifier(s).
+
+Constraints for SQL Implementation Plan
+
+In this section you MUST NOT write executable SQL code or any fenced code blocks.
+You MAY mention common SQL concepts like “filter where SHIPPING_DATE between '2025-01-01' and '2025-12-31'”, “group by BUYER_COUNTRY”, “compute sum(SHIPMENT_VALUE)”, but always in natural language, not as runnable SQL.
+Do NOT change or invent time windows, filters, or metrics beyond what is dictated by this prompt and the user query.
+The SQL Implementation Plan paragraph MUST be fully self-contained so the SQL generator (you, in the next step) does not need to read anything else to build the final Snowflake query.
+
+Generated SQL
+
+After you have written the Interpretation Summary and the SQL Implementation Plan, you MUST generate exactly one valid Snowflake SELECT query that implements the SQL Implementation Plan exactly.
+
+Initial SQL Query Generation Rules
+
+BOOLEAN OPERATOR PRECEDENCE GUARD (CRITICAL)
+
+When the query contains mixed AND and OR logic (common in fuzzy product matching):
+
+MANDATORY PARENTHESES: You MUST wrap all OR groups in their own set of parentheses.
+
+All mandatory filters (e.g., SHIPPING_DATE, BUYER_COUNTRY, BUYER_COMPANY IS NOT NULL) MUST remain outside the product OR logic to ensure they are always applied.
+
+Correct Pattern: WHERE ((Condition_A OR Condition_B) AND Mandatory_Filter_C)
+
+COLUMN ALIAS SCOPE RULE (STRICT & CRITICAL)
+Aliases defined in a SELECT clause are logically created after the GROUP BY and HAVING clauses have been evaluated.
+
+Prohibition: You are strictly forbidden from referencing a SELECT alias within a GROUP BY or HAVING clause in the same query block.
+
+Mandatory Repetition: You MUST repeat the raw aggregate function or the full source expression within these clauses to ensure valid execution.
+
+CTE Materialization: For high-complexity expressions where repetition is impractical, you MUST calculate the value in a preceding CTE. You may then reference that column normally in any subsequent query level.
+
+Scope Compliance: This ensures absolute alignment with the Snowflake query optimizer’s evaluation order and prevents "Invalid Identifier" errors.
+
+ARRAY ACCESS PATTERN (CRITICAL)
+
+Snowflake does NOT support standard bracket notation array[index] for certain operations or PostgreSQL-style array handling.
+
+Use GET(array_expr, index) to retrieve specific elements.
+
+Alternatively, use the colon notation with explicit casting if accessing a variant: array_expr[0]::VARIANT.
+
+For ranking the "first" or "latest" record in a set, prioritize the ROW_NUMBER() pattern within a CTE over array aggregation.
+
+AGGREGATION FUNCTION RULES (CRITICAL)
+
+LISTAGG: Snowflake's LISTAGG does NOT support DISTINCT. You MUST deduplicate values in a prior CTE or subquery before applying LISTAGG.
+
+PERCENTILE_CONT: You MUST use the exact syntax: PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY column_name).
+
+REGRESSION: REGR_SLOPE and REGR_R2 functions MUST use a materialized time_index (integer) from a prior CTE. You are strictly forbidden from passing a ROW_NUMBER() function directly as an argument to a regression function.
+
+The query MUST:
+
+Use only the tdb_exports table (you may alias it, e.g., td).
+Use only the known columns from the schema: SHIPPING_DATE, QUANTITY, SHIPMENT_VALUE, PRODUCT_DESCRIPTION, BUYER_COUNTRY, BUYER_STATE, BUYER_CITY, BUYER_ADDRESS, BUYER_COMPANY, PORT_OF_DESTINATION, SELLER_COUNTRY, SELLER_STATE, SELLER_CITY, SELLER_ADDRESS, SELLER_COMPANY, PORT_OF_ORIGIN, UNIT, DECL_NO, HS_CODE.
+Use SHIPPING_DATE for all time filters.Ensure the generated SQL follows Snowflake-specific syntax; specifically, you MUST use DATE_TRUNC('MONTH', SHIPPING_DATE) for all monthly aggregations and DATEADD for period shifts.
+Implement all time windows, filters, grouping, aggregations, average price logic, growth/comparison logic, regression/seasonality logic, and onboarding logic exactly as described in the SQL Implementation Plan. If you omit any described filter or logic, the query is WRONG.
+Enforce universal case insensitivity for all text comparisons, joins, and grouping keys by wrapping both the column and the literal in UPPER(...), and apply this consistently across all CTEs so the same entity cannot split due to casing.
+
+Aggregation null/zero handling rules:
+
+For any aggregate SUM used as a standalone metric or as an input into arithmetic (e.g., totals, current/previous values, gaps), wrap it as COALESCE(SUM(...), 0) so missing data is treated as zero rather than NULL.
+Do NOT COALESCE the denominator of ratio metrics; always use NULLIF(denominator, 0) to prevent division-by-zero and preserve NULL when undefined.
+For COUNT-based metrics (e.g., shipment counts), use COUNT(*) or COUNT(DISTINCT ...) as specified; do NOT COALESCE counts unless required as an arithmetic input.
+
+TEXT MATCHING & FUZZY SEARCH RULES
+
+[FUZZY TARGET] columns: PRODUCT_DESCRIPTION, BUYER_COMPANY, SELLER_COMPANY, PORT_OF_ORIGIN, PORT_OF_DESTINATION.
+When the SQL Implementation Plan says “contains” or implies fuzzy/approximate matching, the Generated SQL MUST use exactly:
+(UPPER(td.PRODUCT_DESCRIPTION) LIKE '%' || UPPER('<product name>') || '%' OR JAROWINKLER_SIMILARITY(UPPER(td.PRODUCT_DESCRIPTION), UPPER('<product name>')) > 80)
+For non–[FUZZY TARGET] text columns, when the plan says “contains”, use:
+UPPER(column_name) LIKE '%' || UPPER('search text') || '%'
+General rules:
+NEVER use ILIKE.
+The Generated SQL MUST NOT attempt to create extensions or indexes; assume JAROWINKLER_SIMILARITY is available.
+
+Trend/Demand regression implementation guard (CRITICAL)
+
+Generated SQL MUST follow the Regression CTE Stack Template: period_agg → indexed_series (materialized time_index) → regression_results. REGR_SLOPE/REGR_R2 MUST use time_index. Generated SQL MUST NOT contain the forbidden shortcut pattern REGR_*(metric_value, ROW_NUMBER() OVER (...)) and MUST NOT use EXTRACT(EPOCH...) as regression x-axis.
+
+Average price implementation in SQL
+
+Implement average price exactly as described in the SQL Implementation Plan:
+Always apply all filters first.
+Never mix different unit values in the same denominator; average price must always be per-unit.
+If a specific unit is requested, filter by that unit.
+If no unit is specified and average price is needed, group by unit, count rows per unit, select the top 3 units by row count, and for each chosen unit compute avg_unit_price as SUM(SHIPMENT_VALUE) / SUM(QUANTITY) only where SUM(QUANTITY) > 0.
+Never use AVG(unit_price) when unit may vary.
+
+Onboarding / relationship implementation in SQL
+
+Implement onboarding / relationship logic exactly as described in the SQL Implementation Plan:
+Identify (SELLER_COMPANY, BUYER_COMPANY) pairs within the target period that match all filters.
+Exclude any such pairs that appear in earlier records (before the period start) with the same geography and product filters.
+Return the requested entity grain (e.g., BUYER_COUNTRY), but onboarding exclusion MUST be evaluated at the relationship-pair level before projection/aggregation.
+
+Final formatting rules for Generated SQL
+
+You MUST return a single SELECT statement (CTEs WITH ... AS allowed).
+You MUST NOT include any CREATE, ALTER, DROP, INSERT, UPDATE, or DELETE statements.
+You MUST NOT include any natural-language explanation or comments anywhere in the SQL (no -- and no /* */).
+You MUST NOT wrap the SQL in markdown code fences.
+The contents of the "Generated SQL" section must be only the SQL statement text, nothing else."""
+PROMPT_B_TEMPLATE = """Snowflake Trade Query Fixer — Error-Driven SQL Rewriter
+
+You are a Snowflake SQL error-fixing engine for a trade analytics warehouse.
+
+You receive:
+- The original natural-language user query.
+- The authoritative Interpretation Summary and SQL Implementation Plan from Prompt A.
+- The current database schema for the tdb_exports table.
+- A history of previous SQL attempts with the exact Snowflake error messages.
+- The latest failing SQL query and its error.
+
+Your job is to:
+- Analyze the Snowflake error message.
+- Compare it against the latest SQL query, the schema, and the SQL Implementation Plan.
+- Produce a corrected Snowflake SELECT query that:
+  - FIXES the error,
+  - PRESERVES the intent and logic from the Interpretation Summary and SQL Implementation Plan,
+  - and RESPECTS all global SQL rules defined in this prompt.
+
+You MUST NOT change the user's analytical intent. You are only allowed to fix syntactic, semantic, and schema-related issues in the SQL.
+
+
+-----------------------------
+INPUT CONTEXT
+-----------------------------
+
+Today's date: {current_date}
+
+USER QUERY:
+{user_query}
+
+INTERPRETATION SUMMARY (authoritative):
+{interpretation_summary}
+
+SQL IMPLEMENTATION PLAN (authoritative – do NOT contradict):
+{sql_implementation_plan}
+
+SCHEMA (tdb_exports table — column names and types):
+{schema_description}
+
+ATTEMPT HISTORY (from oldest to newest, including the latest failed attempt):
+{attempt_history}
+
+/*
+Each attempt in attempt_history is formatted like:
+Attempt 1:
+SQL:
+<previous_sql_1>
+ERROR:
+<snowflake_error_message_1>
+
+Attempt 2:
+SQL:
+<previous_sql_2>
+ERROR:
+<snowflake_error_message_2>
+...
+*/
+
+LATEST ATTEMPT INDEX: {latest_attempt_index}
+
+LATEST SQL (the one that just failed):
+{latest_sql}
+
+LATEST ERROR (from Snowflake):
+{latest_error}
+
+
+-----------------------------
+GLOBAL CONSTRAINTS
+-----------------------------
+
+1) You MUST preserve the analytical intent
+- You MUST follow the INTERPRETATION SUMMARY and SQL IMPLEMENTATION PLAN.
+- You MUST NOT change:
+  - Time windows (start_date, end_date) or period logic.
+  - Direction and geography filters (SELLER_COUNTRY, BUYER_COUNTRY).
+  - Product filters and logic (PRODUCT_DESCRIPTION, HS_CODE usage).
+  - Port logic (PORT_OF_ORIGIN, PORT_OF_DESTINATION, neutral port rules).
+  - Grouping grain (who, which product, by port, etc.).
+  - Growth/comparison definitions (current vs previous periods, gaps).
+
+You may:
+- Fix column/alias names.
+- Adjust join/CTE structures if needed (while keeping logic equivalent).
+- Wrap aggregates in COALESCE where required.
+- Correct text functions (UPPER, LIKE, JAROWINKLER_SIMILARITY).
+- Fix syntax mistakes (missing commas, GROUP BY mismatches, etc.).
+- Replace PostgreSQL-specific syntax with Snowflake equivalents.
+
+2) Table and columns
+- You MUST use only the single table: tdb_exports (you may alias it, e.g., td).
+- You MUST use only these known columns, with the correct data types:
+
+  SHIPPING_DATE (date)
+  QUANTITY (numeric)
+  SHIPMENT_VALUE (numeric)
+  PRODUCT_DESCRIPTION (text)
+  BUYER_COUNTRY (text)
+  BUYER_STATE (text)
+  BUYER_CITY (text)
+  BUYER_ADDRESS (text)
+  BUYER_COMPANY (text)
+  PORT_OF_DESTINATION (text)
+  SELLER_COUNTRY (text)
+  SELLER_STATE (text)
+  SELLER_CITY (text)
+  SELLER_ADDRESS (text)
+  SELLER_COMPANY (text)
+  PORT_OF_ORIGIN (text)
+  UNIT (text)
+  DECL_NO (text)
+  HS_CODE (text)
+
+- You MUST NOT introduce any other tables or columns.
+- You MUST NOT use DECL_NO as a grouping/aggregation dimension.
+- You MUST NOT use DECL_NO for relationship logic.
+
+3) Time and filters
+- All time filters MUST use SHIPPING_DATE.
+- All time windows MUST match those in the SQL Implementation Plan.
+- You MUST NOT change the literal date ranges (start and end dates) defined in the Implementation Plan.
+- Use DATEADD(MONTH, -N, SHIPPING_DATE) for date arithmetic.
+- Use DATE_TRUNC('MONTH', SHIPPING_DATE) for monthly truncation.
+
+
+CALENDAR DATE CORRECTION RULE
+
+If the latest Snowflake error indicates an invalid or out-of-range date for SHIPPING_DATE (for example: "Date '2026-02-29' is not recognized"):
+
+- You MAY correct only the invalid calendar day while preserving:
+  - The same year.
+  - The same month.
+  - The same role of the date (start vs end of period).
+
+- When correcting, you MUST:
+  - Adjust the invalid day DOWN to the nearest valid day in that same month.
+  - Prefer the last valid day of the month for end-date style boundaries.
+  - Example: 2026-02-29 → 2026-02-28.
+
+- You MUST NOT:
+  - Change the month or year.
+  - Widen or shrink the window beyond what is logically intended in the SQL Implementation Plan.
+  - Invent new periods.
+
+This correction is only allowed when the Snowflake error explicitly points to an invalid date and the intended window clearly targets that calendar month.
+
+
+4) Aggregate safety (COALESCE)
+- For any SUM used as a standalone metric or in any growth/comparison calculation, you MUST wrap it as COALESCE(SUM(...), 0).
+  Examples:
+  - COALESCE(SUM(SHIPMENT_VALUE), 0)
+  - COALESCE(SUM(CASE ... THEN SHIPMENT_VALUE ELSE 0 END), 0)
+- This applies to:
+  - Totals (total_value, total_exports, total_imports, etc.).
+  - Period aggregates (current_period_value, previous_period_value, etc.).
+  - Any SUM that feeds directly into subtraction or growth formulas.
+- You MUST ensure the value used in arithmetic is not NULL.
+
+5) Case-insensitive text logic
+- UNIVERSAL RULE: All text comparisons MUST be case-insensitive via UPPER(...).
+- Exact match:
+  UPPER(column_name) = UPPER('Literal')
+- IN:
+  UPPER(column_name) IN (UPPER('A'), UPPER('B'))
+
+6) "Contains" / substring / fuzzy logic
+- [FUZZY TARGET] columns (must use JAROWINKLER_SIMILARITY when the plan says "contains" or fuzzy match):
+  - PRODUCT_DESCRIPTION
+  - BUYER_COMPANY
+  - SELLER_COMPANY
+  - PORT_OF_ORIGIN
+  - PORT_OF_DESTINATION
+
+  For these:
+  - When the plan says "contains" or implies fuzzy search, you MUST use:
+    (UPPER(column_name) LIKE '%' || UPPER('search text') || '%' OR JAROWINKLER_SIMILARITY(UPPER(column_name), UPPER('search text')) > 80)
+
+- Non–[FUZZY TARGET] text columns:
+  - When the plan says "contains", you MUST use:
+    UPPER(column_name) LIKE '%' || UPPER('search text') || '%'
+
+- You MUST NOT use ILIKE.
+- You MUST NOT use PostgreSQL's % (trigram similarity) operator.
+- You MUST NOT use word_similarity() - Snowflake does not support it.
+
+
+7) Average price logic
+If the Implementation Plan requires an average price:
+- Apply all filters BEFORE aggregation.
+- Never mix different units in a single average.
+- If a specific unit is specified, filter by that unit (using UPPER(UNIT) = UPPER('UNIT')).
+- If no unit is specified and average price is needed:
+  - Group by UNIT.
+  - Count rows per unit.
+  - Select the top 3 units by row count.
+  - For each chosen unit compute:
+    avg_unit_price = COALESCE(SUM(SHIPMENT_VALUE), 0) / NULLIF(SUM(QUANTITY), 0)
+- You MUST NOT divide by zero (use NULLIF(SUM(QUANTITY), 0) in the denominator).
+- If the Implementation Plan does NOT mention average price, you MUST NOT invent it in the SQL.
+
+
+8) Onboarding / relationship logic
+If the Implementation Plan describes onboarding:
+- Identify (SELLER_COMPANY, BUYER_COMPANY) pairs in the target (current) period that match all filters.
+- Exclude pairs that appear in earlier records (before the period start) with the same geography and product filters.
+- Return distinct requested entities (e.g., BUYER_COMPANY).
+- You may use CTEs (e.g., current_period_pairs, historical_pairs) to structure this, but the logic MUST match the Implementation Plan.
+
+
+9) GROUP BY consistency
+Snowflake requires that every non-aggregated column in the SELECT list appears in the GROUP BY clause at the same query level.
+
+Therefore, you MUST:
+- For each SELECT level with aggregation:
+  - Ensure every column that is not wrapped in an aggregate function (e.g., SUM, COUNT, MAX) is listed in that query's GROUP BY.
+
+When fixing GROUP BY errors:
+- FIRST, check the SQL Implementation Plan to see which grouping dimensions are required (e.g., group by BUYER_COMPANY, BUYER_COUNTRY, HS_CODE, port_name).
+- THEN:
+  - Add any missing required columns from the SELECT list to the GROUP BY.
+  - If the SELECT contains extra non-aggregated columns that are NOT required by the Implementation Plan, you MAY remove those columns from the SELECT instead of adding them to the GROUP BY.
+
+You MUST NOT:
+- Change the intended grouping grain described in the SQL Implementation Plan (for example, do NOT switch from grouping by BUYER_COMPANY to grouping by BUYER_COUNTRY if the plan says group by BUYER_COMPANY).
+- Introduce DECL_NO into GROUP BY, as it is not a valid grouping dimension.
+
+
+-----------------------------
+HOW TO FIX THE QUERY
+-----------------------------
+
+1) Read the LATEST ERROR carefully.
+   - If it mentions a missing column, fix the column name or remove/replace that reference according to the schema and the Implementation Plan.
+   - If it mentions a syntax error, fix commas, parentheses, GROUP BY, aliases, etc.
+   - If it mentions a type error, adjust casts or functions (e.g., do NOT apply UPPER to non-text types).
+   - If it mentions a GROUP BY or aggregate error, ensure all non-aggregated selected columns are in GROUP BY.
+   - If it mentions an invalid or out-of-range date on SHIPPING_DATE, apply the CALENDAR DATE CORRECTION RULE instead of changing the period semantics.
+   - If it mentions "Unknown function" or "Function not found", replace PostgreSQL functions with Snowflake equivalents (e.g., word_similarity → JAROWINKLER_SIMILARITY, % → LIKE).
+
+2) Look at ATTEMPT HISTORY to avoid repeating the same mistake.
+   - If the same pattern of error appears in multiple attempts, change the structure more fundamentally (e.g., adjust CTE structure or aggregate logic) while still respecting the Implementation Plan.
+
+3) Make the minimal change necessary to satisfy:
+   - The error is fixed.
+   - The logic remains consistent with the Interpretation Summary and SQL Implementation Plan.
+   - All global constraints above are respected.
+   You MUST NOT refactor the entire query structure unless the error explicitly requires structural changes (e.g., invalid reference to a non-existent CTE or illegal nesting).
+
+4) If you are unsure about the exact fix, prefer:
+   - Dropping or simplifying non-essential derived columns that are not required by the Implementation Plan, rather than changing time windows or filters.
+   - Using explicit aliases and straightforward SELECT/CTE structure.
+
+
+-----------------------------
+OUTPUT REQUIREMENT
+-----------------------------
+
+You MUST output ONLY the corrected Snowflake SELECT query, and nothing else.
+
+- You MAY use CTEs (WITH ... AS ...) as needed.
+- You MUST NOT include any CREATE, ALTER, DROP, INSERT, UPDATE, or DELETE statements.
+- You MUST NOT include comments or natural-language explanation.
+- You MUST NOT wrap the query in markdown code fences.
+- The output must be ONLY the SQL query text.
+
+Be precise, deterministic, and strictly aligned to the SQL Implementation Plan from Prompt A.
+Do NOT be conversational."""
+PROMPT_C_TEMPLATE = """Senior Trade Analytics Narrator — Result-to-Insight Formatter
+
+You are a response formatter that turns executed SQL results from a trade-data warehouse into clear, concise natural-language answers for business users.
+
+You NEVER change the meaning of the numbers.
+You ONLY describe what is already present in the SQL results and the upstream intent.
+
+You receive:
+
+The original user query in natural language.
+
+The Interpretation Summary from the intent engine (Prompt A).
+
+Optionally, the SQL Implementation Plan from Prompt A.
+
+The exact SQL statement that was executed successfully.
+
+The result set returned by Postgres, as structured data (rows and columns).
+
+The current date for reference.
+
+You MUST obey the intent described in the Interpretation Summary and MUST NOT contradict the SQL results.
+
+INPUT CONTEXT
+
+Today’s date: {current_date}
+
+USER QUERY:
+{user_query}
+
+INTERPRETATION SUMMARY (authoritative meaning of the question):
+{interpretation_summary}
+
+SQL IMPLEMENTATION PLAN (for context; do NOT contradict):
+{sql_implementation_plan}
+
+EXECUTED SQL (do NOT explain or rewrite this; just for reference):
+{executed_sql}
+
+RESULT SET (this is the ONLY source of numbers you may use):
+
+Row count: {row_count}
+
+Columns: {column_names}
+
+Data (JSON or table-like text):
+{result_rows}
+
+STRICT BEHAVIOR RULES
+
+Never hallucinate
+
+You MUST NOT invent values, dates, ports, products, or entities that are not present in the result_rows or clearly implied by the Interpretation Summary.
+
+If a value is not in the result, you must say that it is not available, instead of guessing.
+
+1b) Insight completeness (CRITICAL)
+
+If the result set includes diagnostic or decision-support columns (examples: demand_countries_count, demand_country_count, slope, r2, avg_value_per_seller, competition_score, product_competition_score, best_buyer_country, buyer_country, month_of_year, unit, avg_unit_price, total_value_usd, total_quantity), the narrative MUST include them and explain what they represent in the context of the Interpretation Summary.
+
+If the Interpretation Summary implies such metrics but the result set does NOT contain them, the narrative MUST explicitly state that these details were not returned in the result set.
+
+Respect time windows
+
+Use the time period implied by the Interpretation Summary / Implementation Plan (e.g., “between 2025-03-01 and 2026-02-28”, “calendar year 2025”, “last 6 months”).
+
+When possible, mention the period explicitly in the narrative (e.g., “in the 12 months from March 1, 2025 to February 28, 2026”).
+
+2b) Fallback disclosure (CRITICAL)
+
+If the Interpretation Summary indicates fallback mode (for example, mentions “WEAK TREND (fallback)” or “WEAK DEMAND (fallback)”), you MUST explicitly state that fallback logic was used.
+
+If fallback mode is mentioned but the result set does not contain fallback labels/metrics, you MUST say that fallback status/metrics are not present in the returned results.
+
+If the result set contains fallback labels/fields, you MUST quote those labels exactly (e.g., “WEAK DEMAND (fallback)”) and use only the numbers present.
+
+Metric naming
+
+When the result has a single numeric value, explain what it represents using the Interpretation Summary.
+Example: “Cotton exports from India increased by 12.3M USD in the last 12 months compared to the previous 12 months.”
+
+If the metric is value_usd, explicitly mention currency as “USD”.
+
+If the result includes quantity and unit, mention both (e.g., “25,000 MT”).
+
+Different result shapes
+
+a) Single-row, single-metric (e.g., one number):
+
+Provide 1–3 sentences explaining:
+
+What the number is.
+
+Which period.
+
+Compared to what (if growth/comparison).
+
+Do NOT refer to “rows” or “columns”; speak in business language.
+
+b) Single-row, multiple metrics:
+
+Explain the most important metric first (usually value_usd).
+
+Tie the metrics together in 2–4 sentences.
+
+c) Multiple rows (ranking / lists):
+
+Summarize the ranking or list:
+
+Mention how many rows were returned (“top 5 ports”, “3 new importers”, etc. based on row_count).
+
+Highlight the top 1–3 items explicitly, then optionally summarize the rest.
+
+Use bullet points ONLY if it makes sense (for listing entities like buyer_name or seller_name).
+
+If the query is “who are the importers/exporters…”, emphasize the entity names (buyer_name or seller_name).
+
+c2) Top result justification (CRITICAL)
+
+When the output is a ranking, you MUST explain why the top item ranks first using the ranking metric column(s) present in the results (examples: growth_rate, total_value_usd, avg_unit_price, competition_score).
+
+If the output contains identifiers only (e.g., only hs_code or only buyer_name), you MUST state that the ranking metric or supporting metrics were not included in the result output, so only the identifier(s) can be reported.
+
+d) Empty result (row_count == 0):
+
+Clearly say that no matching records were found for the requested filters and period.
+
+Offer a neutral explanation, like:
+“There are no recorded shipments matching those criteria in the selected period.”
+
+Language & style
+
+Be concise and direct; 2–6 sentences is usually enough.
+
+Do NOT mention SQL, tables, CTEs, or database internals.
+
+Do NOT paste JSON.
+
+Do NOT restate the full user query; rephrase only what is necessary for clarity.
+
+You may use numbers from the result as-is but format large numbers with thousand separators if appropriate.
+
+Do not apologize or say you are an AI.
+
+OUTPUT FORMAT
+
+You MUST output your answer using exactly this single heading:
+
+Narrative Answer
+
+Under this heading, write a short narrative paragraph (optionally with bullet points when listing entities) that:
+
+Answers the USER QUERY from the business perspective.
+
+Is consistent with the INTERPRETATION SUMMARY.
+
+Reflects ONLY the values present in RESULT SET.
+
+Explicitly mentions the time period and key filters (countries, product, ports) when relevant.
+
+Includes the most decision-useful metrics present in the result set (per rule 1b).
+
+If there are no rows:
+“There are no recorded shipments matching those criteria in the selected period, so the requested metric cannot be computed.”
+
+Do NOT output anything except the “Narrative Answer” heading and the narrative text.
+""".strip()
+
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+# =========================================================
+# REQUEST MODELS
+# =========================================================
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+    source: Optional[str] = None  # "followup" or None
+
+class ConfirmRequest(BaseModel):
+    session_id: str
+    decision: str  # "proceed" | "cancel"
+
+# =========================================================
+# UTIL
+# =========================================================
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+def current_date_iso() -> str:
+    return datetime.date.today().isoformat()
+
+def current_date_pretty() -> str:
+    return datetime.date.today().strftime("%B %d, %Y")
+
+def has_real_prompt(template: str) -> bool:
+    return bool(template) and "<PASTE_" not in template
+
+def strip_markdown_fences(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("```sql", "").replace("```SQL", "").replace("```", "").strip()
+
+def convert_decimals(obj):
+    if isinstance(obj, list):
+        return [convert_decimals(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
+
+def dedupe_preserve(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for q in items or []:
+        if not isinstance(q, str):
+            continue
+        s = q.strip()
+        if not s:
+            continue
+        key = re.sub(r"\s+", " ", s).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+# =========================================================
+# UI MESSAGE HELPERS
+# =========================================================
+def msg_answer(content: str, data: Optional[dict] = None) -> Dict[str, Any]:
+    return {"type": "answer", "content": content, "data": data or {}}
+
+def msg_clarification(content: str) -> Dict[str, Any]:
+    return {"type": "clarification", "content": content, "data": {}}
+
+def msg_confirm(resolved_query: str) -> Dict[str, Any]:
+    return {"type": "confirm", "content": "Confirm:", "data": {"resolved_query": resolved_query}}
+
+def msg_followup(items: List[str], title: str = "Suggested questions:") -> Dict[str, Any]:
+    return {"type": "followup", "content": title, "data": {"items": items[:3]}}
+
+# =========================================================
+# SESSION MEMORY
+# =========================================================
+def new_session_state() -> Dict[str, Any]:
+    return {
+        "state": STATE_SETUP,
+        "conversation_last_10": [],  # list of {role, content, ts}
+        "active_focus": {
+            "product_name": None,
+            "hs_code": None,
+            "pending_query_text": None,
+            "pending_clarification": None,
+            "last_executed_query_text": None,
+            "last_executed_answer": None,
+        },
+        "last_trace": None,          # right panel trace after Proceed
+        "last_followups_sets": [],   # last 2 sets, each set=3 strings
+    }
+
+def append_turn(session: Dict[str, Any], role: str, content: str):
+    session["conversation_last_10"].append({"role": role, "content": content, "ts": now_ms()})
+    if len(session["conversation_last_10"]) > HISTORY_TURNS:
+        session["conversation_last_10"] = session["conversation_last_10"][-HISTORY_TURNS:]
+
+def recent_turns(session: Dict[str, Any]) -> List[Dict[str, str]]:
+    turns = session["conversation_last_10"][-HISTORY_TURNS:]
+    return [{"role": t["role"], "content": t["content"]} for t in turns]
+
+def safe_fallback_followups(session: Dict[str, Any]) -> List[str]:
+    p = session["active_focus"].get("product_name") or session["active_focus"].get("hs_code") or "this product"
+    base = [
+        f"Who are the top buyers of {p} in the last 24 months?",
+        f"Which countries are showing increasing demand for {p} in the last 24 months?",
+        f"Which markets have low competition for {p} in the last 12 months?",
+        f"Which buyers pay premium prices for {p} in the last 24 months?",
+        f"Which month does demand for {p} usually peak over the last 36 months?",
+    ]
+    banned = set()
+    for s in session["last_followups_sets"][-2:]:
+        for q in s:
+            banned.add(q.strip().lower())
+    out = []
+    for q in base:
+        if q.strip().lower() not in banned:
+            out.append(q)
+        if len(out) == 3:
+            break
+    while len(out) < 3:
+        out.append(base[len(out)])
+    return out[:3]
+
+def store_followups(session: Dict[str, Any], followups: List[str]):
+    followups = dedupe_preserve(followups)
+    if len(followups) < 3:
+        followups = dedupe_preserve(safe_fallback_followups(session))
+    followups = followups[:3]
+    session["last_followups_sets"].append(followups)
+    if len(session["last_followups_sets"]) > 2:
+        session["last_followups_sets"] = session["last_followups_sets"][-2:]
+
+# =========================================================
+# GEMINI CALLS
+# =========================================================
+def call_gemini(prompt: str, max_tokens: int, temperature: float = 0.0) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+            "topP": 0.95,
+        },
+    }
+    resp = requests.post(
+        GEMINI_MODEL_URL,
+        headers={"Content-Type": "application/json"},
+        params={"key": GEMINI_API_KEY},
+        data=json.dumps(payload),
+        timeout=120,
+    )
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", "Gemini API error"))
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+def fallback_normalize(text: str) -> str:
+    t = (text or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+def normalize_user_message(raw_message: str) -> str:
+    raw_message = (raw_message or "").strip()
+    if not raw_message:
+        return raw_message
+    if not has_real_prompt(NORMALIZE_PROMPT_TEMPLATE):
+        return fallback_normalize(raw_message)
+
+    prompt = (NORMALIZE_PROMPT_TEMPLATE
+              .replace("{current_date}", current_date_pretty())
+              .replace("{raw_message}", raw_message))
+
+    try:
+        out = call_gemini(prompt, max_tokens=NORMALIZE_MAX_TOKENS, temperature=0.0).strip()
+        out = strip_markdown_fences(out).strip().strip('"').strip("'")
+        return fallback_normalize(out or raw_message)
+    except Exception:
+        return fallback_normalize(raw_message)
+
+def parse_json_strict(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        m = re.search(r"(?s)\{.*\}", raw)
+        if m:
+            return json.loads(m.group(0))
+    raise RuntimeError("Trade Agent did not return valid JSON")
+
+# =========================================================
+# PRODUCT / HS SETUP
+# =========================================================
+def extract_product_or_hs(text: str) -> Dict[str, Optional[str]]:
+    hs_match = re.search(r"(?i)\b(?:hs|hs code)\b\D*(\d{2,10})\b", text or "")
+    if hs_match:
+        return {"hs_code": hs_match.group(1), "product": None}
+
+    only_digits = (text or "").strip()
+    if re.fullmatch(r"\d{2,10}", only_digits):
+        return {"hs_code": only_digits, "product": None}
+
+    return {"hs_code": None, "product": (text or "").strip()}
+
+# =========================================================
+# TRADE AGENT (single LLM decision)
+# =========================================================
+def build_trade_agent_prompt(session: Dict[str, Any], normalized_message: str) -> str:
+    payload = {
+        "current_date": current_date_iso(),
+        "state": session["state"],
+        "normalized_message": normalized_message,
+        "active_focus": session["active_focus"],
+        "conversation_last_10": recent_turns(session),
+        "last_trace": session["last_trace"],
+        "last_followups_sets": session["last_followups_sets"],
+        "prompt_a_skeleton": PROMPT_A_SKELETON_BIBLE,
+        "schema": SCHEMA_CONTEXT,
+    }
+    return TRADE_AGENT_PROMPT_TEMPLATE.replace(
+        "{TRADE_AGENT_INPUT_JSON}",
+        json.dumps(payload, ensure_ascii=False)
+    )
+
+def call_trade_agent(session: Dict[str, Any], normalized_message: str) -> Dict[str, Any]:
+    if not has_real_prompt(TRADE_AGENT_PROMPT_TEMPLATE):
+        # fallback: simple safe behavior
+        return {
+            "action": "ANSWER_DIRECT",
+            "assistant_text": "Ask a trade question and I’ll help. If you want, click one of the suggested questions.",
+            "clarification_question": None,
+            "final_query_text": None,
+            "followups": safe_fallback_followups(session),
+        }
+    prompt = build_trade_agent_prompt(session, normalized_message)
+    out = call_gemini(prompt, max_tokens=TRADE_AGENT_MAX_TOKENS, temperature=0.0)
+    return parse_json_strict(out)
+
+# =========================================================
+# PROMPT A/B/C PIPELINE (DB execution)
+# =========================================================
+def build_prompt_a(user_query: str) -> str:
+    if not has_real_prompt(PROMPT_A_TEMPLATE):
+        raise RuntimeError("PROMPT_A_TEMPLATE not configured")
+    return (PROMPT_A_TEMPLATE
+            .replace("{current_date}", current_date_pretty())
+            .replace("{user_query}", user_query))
+
+def build_prompt_b(
+    user_query: str, interpretation: str, plan: str,
+    attempt_history: str, latest_sql: str, latest_error: str, attempt_index: int
+) -> str:
+    if not has_real_prompt(PROMPT_B_TEMPLATE):
+        raise RuntimeError("PROMPT_B_TEMPLATE not configured")
+    return (PROMPT_B_TEMPLATE
+            .replace("{current_date}", current_date_pretty())
+            .replace("{user_query}", user_query)
+            .replace("{interpretation_summary}", interpretation)
+            .replace("{sql_implementation_plan}", plan)
+            .replace("{attempt_history}", attempt_history)
+            .replace("{latest_sql}", latest_sql)
+            .replace("{latest_error}", latest_error)
+            .replace("{latest_attempt_index}", str(attempt_index)))
+
+def build_prompt_c(
+    user_query: str, interpretation: str, plan: str,
+    executed_sql: str, rows: List[Dict[str, Any]], cols: List[str]
+) -> str:
+    if not has_real_prompt(PROMPT_C_TEMPLATE):
+        raise RuntimeError("PROMPT_C_TEMPLATE not configured")
+    return (PROMPT_C_TEMPLATE
+            .replace("{current_date}", current_date_pretty())
+            .replace("{user_query}", user_query)
+            .replace("{interpretation_summary}", interpretation)
+            .replace("{sql_implementation_plan}", plan)
+            .replace("{executed_sql}", executed_sql)
+            .replace("{row_count}", str(len(rows)))
+            .replace("{column_names}", ", ".join(cols))
+            .replace("{result_rows}", json.dumps(rows[:20], default=str)))
+
+def parse_prompt_a_output(text: str) -> Dict[str, str]:
+    raw = text or ""
+    interp = ""
+    plan = ""
+    sql = ""
+
+    m = re.search(r"(?is)Interpretation Summary\s*(.*?)(?:SQL Implementation Plan)", raw)
+    if m:
+        interp = m.group(1).strip()
+
+    m = re.search(r"(?is)SQL Implementation Plan\s*(.*?)(?:Generated SQL|Generated\s+SQL|SQL\s*:)", raw)
+    if m:
+        plan = m.group(1).strip()
+
+    m = re.search(r"(?is)Generated SQL\s*:?\s*([\s\S]*)$", raw)
+    if m:
+        sql = strip_markdown_fences(m.group(1).strip())
+
+    if not sql:
+        m = re.search(r"(?is)\b(WITH\b[\s\S]*?;|\bSELECT\b[\s\S]*?;)", raw)
+        sql = m.group(1).strip() if m else ""
+
+    return {
+        "interpretation_summary": interp,
+        "sql_plan": plan,
+        "sql": sql,
+        "raw": raw
+    }
+
+def parse_prompt_b_output(text: str) -> str:
+    raw = strip_markdown_fences(text or "")
+    m = re.search(r"(?is)\b(WITH\b[\s\S]*?;|\bSELECT\b[\s\S]*?;)", raw)
+    return m.group(1).strip() if m else raw.strip()
+
+def get_snowflake_conn():
+    return snowflake.connector.connect(
+        user=SNOWFLAKE_USER,
+        password=SNOWFLAKE_PASSWORD,
+        account=SNOWFLAKE_ACCOUNT,
+        warehouse=SNOWFLAKE_WAREHOUSE,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA,
+        role=SNOWFLAKE_ROLE if SNOWFLAKE_ROLE else None,
+    )
+
+def run_snowflake(sql: str) -> Tuple[bool, List[Dict[str, Any]], List[str], str]:
+    conn = None
+    cur = None
+    try:
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchall() if cur.description else []
+        dict_rows = [dict(zip(cols, r)) for r in rows]
+        return True, dict_rows, cols, ""
+    except Exception as e:
+        return False, [], [], str(e)
+    finally:
+        try:
+            if cur:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def format_attempt_history(attempts: List[Dict[str, str]]) -> str:
+    lines = []
+    for i, a in enumerate(attempts, start=1):
+        lines.append(f"Attempt {i}:\nSQL:\n{a['sql']}\nERROR:\n{a['error']}\n")
+    return "\n".join(lines).strip()
+
+def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
+    a_raw = ""
+    a_parts = {"interpretation_summary": "", "sql_plan": "", "sql": "", "raw": ""}
+
+    try:
+        # Prompt A
+        a_prompt = build_prompt_a(final_query_text)
+        a_raw = call_gemini(a_prompt, max_tokens=PROMPT_A_MAX_TOKENS, temperature=0.0)
+        a_parts = parse_prompt_a_output(a_raw)
+
+        sql_to_run = (a_parts.get("sql") or "").strip()
+        if not sql_to_run:
+            return {
+                "stage": "prompt_a_no_sql",
+                "narrative": "No Prompt A interpretation / plan available.",
+                "sql": "",
+                "rows": [],
+                "cols": [],
+                "prompt_a_raw": a_raw,
+                "prompt_a_parts": a_parts,
+                "error": "Prompt A did not produce SQL",
+            }
+
+        attempts = []
+        for attempt_idx in range(1, MAX_SQL_FIX_ATTEMPTS + 1):
+            ok, rows, cols, err = run_snowflake(sql_to_run)
+            if ok:
+                rows = convert_decimals(rows)
+
+                # Prompt C
+                c_prompt = build_prompt_c(
+                    user_query=final_query_text,
+                    interpretation=a_parts.get("interpretation_summary", ""),
+                    plan=a_parts.get("sql_plan", ""),
+                    executed_sql=sql_to_run,
+                    rows=rows,
+                    cols=cols,
+                )
+                narrative = call_gemini(c_prompt, max_tokens=PROMPT_C_MAX_TOKENS, temperature=0.0).strip()
+
+                return {
+                    "stage": "success",
+                    "narrative": narrative,
+                    "sql": sql_to_run,
+                    "rows": rows,
+                    "cols": cols,
+                    "prompt_a_raw": a_raw,
+                    "prompt_a_parts": a_parts,
+                    "error": None,
+                }
+
+            attempts.append({"sql": sql_to_run, "error": err})
+
+            if attempt_idx == MAX_SQL_FIX_ATTEMPTS:
+                return {
+                    "stage": "sql_execution_failure",
+                    "narrative": "SQL execution failed.",
+                    "sql": sql_to_run,
+                    "rows": [],
+                    "cols": [],
+                    "prompt_a_raw": a_raw,
+                    "prompt_a_parts": a_parts,
+                    "error": err,
+                }
+
+            # Prompt B repair
+            b_prompt = build_prompt_b(
+                user_query=final_query_text,
+                interpretation=a_parts.get("interpretation_summary", ""),
+                plan=a_parts.get("sql_plan", ""),
+                attempt_history=format_attempt_history(attempts[-3:]),
+                latest_sql=sql_to_run,
+                latest_error=err,
+                attempt_index=attempt_idx,
+            )
+            b_raw = call_gemini(b_prompt, max_tokens=PROMPT_B_MAX_TOKENS, temperature=0.0)
+            sql_to_run = parse_prompt_b_output(b_raw)
+
+        return {
+            "stage": "unknown_failure",
+            "narrative": "Execution failed.",
+            "sql": sql_to_run,
+            "rows": [],
+            "cols": [],
+            "prompt_a_raw": a_raw,
+            "prompt_a_parts": a_parts,
+            "error": "Unknown failure",
+        }
+
+    except Exception as e:
+        return {
+            "stage": "pipeline_exception",
+            "narrative": f"Pipeline exception occurred.",
+            "sql": "",
+            "rows": [],
+            "cols": [],
+            "prompt_a_raw": a_raw,
+            "prompt_a_parts": a_parts,
+            "error": str(e),
+        }
+
+# =========================================================
+# ROUTES
+# =========================================================
+@app.get("/")
+def home():
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        return JSONResponse(status_code=404, content={"error": f"index.html not found at: {index_path}"})
+    return FileResponse(index_path)
+
+@app.get("/health")
+def health():
+    return {"ok": True, "model": GEMINI_MODEL}
+
+@app.post("/start_session")
+def start_session():
+    sid = str(uuid.uuid4())
+    SESSIONS[sid] = new_session_state()
+    return {"session_id": sid, "state": SESSIONS[sid]["state"]}
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    if req.session_id not in SESSIONS:
+        return JSONResponse(status_code=400, content={"error": "Invalid session_id"})
+    session = SESSIONS[req.session_id]
+
+    raw_message = (req.message or "").strip()
+    if not raw_message:
+        return JSONResponse(status_code=400, content={"error": "Empty message"})
+
+    # =====================================================
+    # Guardrail A: Followup click bypasses ALL LLMs
+    # =====================================================
+    if req.source == "followup":
+        q = raw_message.strip()  # use EXACT text user clicked
+        append_turn(session, "user", q)
+        session["active_focus"]["pending_query_text"] = q
+        session["state"] = STATE_AWAITING_CONFIRMATION
+        return {"session_id": req.session_id, "state": session["state"], "messages": [msg_confirm(q)]}
+
+    # Typed message -> normalize
+    normalized = normalize_user_message(raw_message)
+    append_turn(session, "user", normalized)
+
+    # Setup: first user message treated as product/HS
+    if session["state"] == STATE_SETUP:
+        parsed = extract_product_or_hs(normalized)
+        if parsed["hs_code"]:
+            session["active_focus"]["hs_code"] = parsed["hs_code"]
+            session["active_focus"]["product_name"] = None
+            label = parsed["hs_code"]
+        else:
+            session["active_focus"]["product_name"] = parsed["product"]
+            session["active_focus"]["hs_code"] = None
+            label = parsed["product"] or "this product"
+
+        session["state"] = STATE_IDLE
+        assistant_text = f"Got it. I’ll focus on: {label}"
+        append_turn(session, "assistant", assistant_text)
+
+        followups = [
+            f"Who are the top buyers of {label} in the last 24 months?",
+            f"Which countries are showing increasing demand for {label} in the last 24 months?",
+            f"Which month does demand for {label} usually peak over the last 36 months?",
+        ]
+        store_followups(session, followups)
+
+        return {
+            "session_id": req.session_id,
+            "state": session["state"],
+            "messages": [
+                msg_answer(assistant_text),
+                msg_followup(followups, title="Here are 3 questions you can run:"),
+            ],
+        }
+
+    # If awaiting confirmation and user types yes/no
+    if session["state"] == STATE_AWAITING_CONFIRMATION:
+        low = normalized.lower().strip()
+        if low in {"yes", "y", "ok", "okay", "proceed", "run"}:
+            return _confirm_internal(req.session_id, "proceed")
+        if low in {"no", "n", "cancel", "stop"}:
+            return _confirm_internal(req.session_id, "cancel")
+
+    # One LLM decision: Trade Agent
+    agent_out = call_trade_agent(session, normalized)
+
+    action = (agent_out.get("action") or "").upper().strip()
+    assistant_text = (agent_out.get("assistant_text") or "").strip()
+    clarification_q = agent_out.get("clarification_question")
+    final_query_text = agent_out.get("final_query_text")
+    followups = agent_out.get("followups") if isinstance(agent_out.get("followups"), list) else []
+
+    if not assistant_text:
+        assistant_text = "Okay."
+
+    messages: List[Dict[str, Any]] = []
+    messages.append(msg_answer(assistant_text))
+    append_turn(session, "assistant", assistant_text)
+
+    followups = dedupe_preserve(followups)
+    if len(followups) < 3:
+        followups = safe_fallback_followups(session)
+    store_followups(session, followups)
+
+    if action == "ASK_CLARIFICATION":
+        session["state"] = STATE_AWAITING_CLARIFICATION
+        if not clarification_q:
+            clarification_q = "What do you want to achieve—buyers/sellers, demand, competition, price, trend, peak month, onboarding, or ports?"
+        session["active_focus"]["pending_clarification"] = clarification_q
+        messages.append(msg_clarification(clarification_q))
+        messages.append(msg_followup(followups, title="Suggested next steps:"))
+        append_turn(session, "assistant", f"Clarification: {clarification_q}")
+        return {"session_id": req.session_id, "state": session["state"], "messages": messages}
+
+    if action == "CONFIRM_QUERY":
+        if not final_query_text:
+            # fallback: ask clarification
+            session["state"] = STATE_AWAITING_CLARIFICATION
+            clarification_q = "Please rephrase as a concrete trade question you want to run."
+            session["active_focus"]["pending_clarification"] = clarification_q
+            messages.append(msg_clarification(clarification_q))
+            messages.append(msg_followup(followups, title="Suggested questions:"))
+            append_turn(session, "assistant", f"Clarification: {clarification_q}")
+            return {"session_id": req.session_id, "state": session["state"], "messages": messages}
+
+        session["active_focus"]["pending_query_text"] = final_query_text
+        session["state"] = STATE_AWAITING_CONFIRMATION
+        messages.append(msg_confirm(final_query_text))
+        messages.append(msg_followup(followups, title="Next best questions:"))
+        return {"session_id": req.session_id, "state": session["state"], "messages": messages}
+
+    # ANSWER_DIRECT (off-topic or history answer)
+    session["state"] = STATE_READY
+    messages.append(msg_followup(followups, title="Suggested questions:"))
+    return {"session_id": req.session_id, "state": session["state"], "messages": messages}
+
+@app.post("/confirm")
+def confirm(req: ConfirmRequest):
+    return _confirm_internal(req.session_id, (req.decision or "").strip().lower())
+
+def _confirm_internal(session_id: str, decision: str):
+    if session_id not in SESSIONS:
+        return JSONResponse(status_code=400, content={"error": "Invalid session_id"})
+    session = SESSIONS[session_id]
+
+    if session["state"] != STATE_AWAITING_CONFIRMATION:
+        return JSONResponse(status_code=400, content={"error": "No pending query to confirm"})
+
+    if decision not in {"proceed", "cancel"}:
+        return JSONResponse(status_code=400, content={"error": "decision must be proceed|cancel"})
+
+    if decision == "cancel":
+        session["active_focus"]["pending_query_text"] = None
+        session["state"] = STATE_IDLE
+        assistant_text = "Cancelled. Ask another trade question anytime."
+        append_turn(session, "assistant", assistant_text)
+
+        followups = safe_fallback_followups(session)
+        store_followups(session, followups)
+
+        return {
+            "session_id": session_id,
+            "state": session["state"],
+            "messages": [
+                msg_answer(assistant_text),
+                msg_followup(followups, title="Suggested questions:"),
+            ],
+        }
+
+    # Proceed -> Prompt A pipeline
+    final_query_text = session["active_focus"].get("pending_query_text") or ""
+    session["active_focus"]["pending_query_text"] = None
+
+    result = execute_prompt_pipeline(final_query_text)
+
+    # Right panel trace
+    trace = {
+        "prompt_a_parts": result.get("prompt_a_parts", {}) or {},
+        "prompt_a_raw": result.get("prompt_a_raw", "") or "",
+        "sql": result.get("sql", "") or "",
+        "rows_preview": (result.get("rows") or [])[:25],
+        "meta": {"stage": result.get("stage")},
+    }
+    if result.get("error"):
+        trace["error"] = result["error"]
+
+    session["last_trace"] = trace
+    session["active_focus"]["last_executed_query_text"] = final_query_text
+
+    narrative = (result.get("narrative") or "").strip()
+    session["active_focus"]["last_executed_answer"] = narrative
+
+    session["state"] = STATE_READY
+    if not narrative:
+        narrative = "Execution completed."
+
+    append_turn(session, "assistant", narrative)
+
+    followups = safe_fallback_followups(session)
+    store_followups(session, followups)
+
+    return {
+        "session_id": session_id,
+        "state": session["state"],
+        "messages": [
+            msg_answer(narrative, data=trace),
+            msg_followup(followups, title="Follow-up questions:"),
+        ],
+    }
+
+@app.get("/favicon.ico")
+def favicon():
+    return JSONResponse(status_code=204, content=None)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
