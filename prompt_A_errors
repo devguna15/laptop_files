@@ -1,0 +1,171 @@
+From which country is LLC TDL TEXTILE CENTER, the top buyer of cotton?
+
+
+The user is asking to identify the single country that has supplied the most cotton, by shipment value, to the specific buyer "LLC TDL TEXTILE CENTER". The analysis will cover a rolling 24-month period ending on March 31, 2026, which is the last completed month prior to today's date of April 22, 2026. The resolved metric for ranking is SHIPMENT_VALUE.
+
+The query will use the tdb_exports table. The time window for analysis will be a rolling 24-month period, starting on '2024-04-01' and ending on '2026-03-31'. Filters will include `SHIPPING_DATE` between '2024-04-01' and '2026-03-31'. Additionally, it will filter for the specific buyer by applying `(UPPER(td.BUYER_COMPANY) LIKE '%LLC TDL TEXTILE CENTER%' OR JAROWINKLER_SIMILARITY(UPPER(td.BUYER_COMPANY), UPPER('LLC TDL TEXTILE CENTER')) > 80)` and ensure `UPPER(td.BUYER_COMPANY) IS NOT NULL AND TRIM(td.BUYER_COMPANY) <> ''`. The product filter will be for 'cotton' using `(UPPER(td.PRODUCT_DESCRIPTION) LIKE '%COTTON%' OR JAROWINKLER_SIMILARITY(UPPER(td.PRODUCT_DESCRIPTION), UPPER('COTTON')) > 80)`. No port filters are required. The metric to be aggregated is `SHIPMENT_VALUE`, which will be summed as `COALESCE(SUM(td.SHIPMENT_VALUE), 0)`. The data will be grouped by `UPPER(td.SELLER_COUNTRY)` to determine the total value from each selling country. The results will be ordered by the aggregated `total_value_usd` in descending order, and a `LIMIT 1` will be applied to identify the single top country. The final output will conceptually contain one row with columns for the `SELLER_COUNTRY` and its `total_value_usd`.
+Generated SQL
+Copy SQL
+WITH filtered_data AS (
+    SELECT
+        UPPER(td.SELLER_COUNTRY) AS SELLER_COUNTRY_NORM,
+        td.SHIPMENT_VALUE
+    FROM
+        tdb_exports AS td
+    WHERE
+        td.SHIPPING_DATE BETWEEN '2024-04-01' AND '2026-03-31'
+        AND UPPER(td.BUYER_COMPANY) IS NOT NULL AND TRIM(td.BUYER_COMPANY) <> ''
+        AND (
+            UPPER(td.BUYER_COMPANY) LIKE '%LLC TDL TEXTILE CENTER%'
+            OR JAROWINKLER_SIMILARITY(UPPER(td.BUYER_COMPANY), UPPER('LLC TDL TEXTILE CENTER')) > 80
+        )
+        AND (
+            UPPER(td.PRODUCT_DESCRIPTION) LIKE '%COTTON%'
+            OR JAROWINKLER_SIMILARITY(UPPER(td.PRODUCT_DESCRIPTION), UPPER('COTTON')) > 80
+        )
+)
+SELECT
+    fd.SELLER_COUNTRY_NORM AS SELLER_COUNTRY,
+    COALESCE(SUM(fd.SHIPMENT_VALUE), 0) AS total_value_usd
+FROM
+    filtered_data AS fd
+GROUP BY
+    fd.SELLER_COUNTRY_NORM
+ORDER BY
+    total_value_usd DESC
+LIMIT 1;
+Execution Result · Narrative Answer & Rows
+Clear
+Execution completed.
+Narrative Answer
+Narrative Answer
+For LLC TDL TEXTILE CENTER, the top country supplying cotton by shipment value was Uzbekistan, with a total shipment value of $162,511,179,928.30 USD. This analysis covers the rolling 24-month period from April 1, 2024, to March 31, 2026.
+
+
+
+What are the different ports in India for cotton?
+
+The user is asking for a distinct list of ports located in India that are involved in the trade of cotton. The analysis will cover a rolling 24-month period ending on March 31, 2026. No specific metrics like value or quantity are requested, only the names of the ports.
+
+The query will use the tdb_exports table. The time window for analysis will be a rolling 24-month period, starting on '2024-04-01' and ending on '2026-03-31'. The data will first be filtered to include only shipments within this date range. Additionally, a product filter will be applied to identify "cotton" using a fuzzy match on PRODUCT_DESCRIPTION, specifically `(UPPER(td.PRODUCT_DESCRIPTION) LIKE '%COTTON%' OR JAROWINKLER_SIMILARITY(UPPER(td.PRODUCT_DESCRIPTION), UPPER('COTTON')) > 80)`. To identify ports in India, the query will select `UPPER(TRIM(td.PORT_OF_ORIGIN))` from records where `UPPER(td.SELLER_COUNTRY) = 'INDIA'` and `PORT_OF_ORIGIN` is not null or empty, and it will select `UPPER(TRIM(td.PORT_OF_DESTINATION))` from records where `UPPER(td.BUYER_COUNTRY) = 'INDIA'` and `PORT_OF_DESTINATION` is not null or empty. These two sets of port names will be combined using `UNION ALL`. Finally, a `SELECT DISTINCT` operation will be performed on the combined port names to get a unique list, and the results will be ordered alphabetically by port name. No specific aggregations, growth calculations, or comparisons are required. No 
+
+WITH filtered_data AS (
+    SELECT
+        td.SHIPPING_DATE,
+        UPPER(td.PRODUCT_DESCRIPTION) AS product_description_norm,
+        UPPER(td.SELLER_COUNTRY) AS seller_country_norm,
+        UPPER(td.BUYER_COUNTRY) AS buyer_country_norm,
+        UPPER(TRIM(td.PORT_OF_ORIGIN)) AS port_of_origin_norm,
+        UPPER(TRIM(td.PORT_OF_DESTINATION)) AS port_of_destination_norm
+    FROM
+        tdb_exports AS td
+    WHERE
+        td.SHIPPING_DATE BETWEEN '2024-04-01' AND '2026-03-31'
+        AND (
+            (UPPER(td.PRODUCT_DESCRIPTION) LIKE '%COTTON%' OR JAROWINKLER_SIMILARITY(UPPER(td.PRODUCT_DESCRIPTION), UPPER('COTTON')) > 80)
+        )
+)
+SELECT DISTINCT port_name
+FROM (
+    SELECT port_of_origin_norm AS port_name
+    FROM filtered_data
+    WHERE seller_country_norm = 'INDIA'
+      AND port_of_origin_norm IS NOT NULL
+      AND port_of_origin_norm <> ''
+
+    UNION ALL
+
+    SELECT port_of_destination_norm AS port_name
+    FROM filtered_data
+    WHERE buyer_country_norm = 'INDIA'
+      AND port_of_destination_norm IS NOT NULL
+      AND port_of_destination_norm <> ''
+)
+ORDER BY port_name;
+Execution Result · Narrative Answer & Rows
+Clear
+Execution completed.
+Narrative Answer
+Narrative Answer
+During the 24-month period from April 1, 2024, to March 31, 2026, a total of 95 distinct ports were identified as being involved in cotton trade where India was either the seller or the buyer. These ports include major locations such as Ahmedabad, Bangalore, Calcutta, Chennai, and Cochin, among many others.
+Raw Rows (JSON)
+[
+  {
+    "PORT_NAME": "AHMEDABAD"
+  },
+  {
+    "PORT_NAME": "BADDI"
+  },
+  {
+    "PORT_NAME": "BALLABGARH"
+  },
+  {
+    "PORT_NAME": "BANGALORE"
+  },
+  {
+    "PORT_NAME": "BANGKOK"
+  },
+  {
+    "PORT_NAME": "BHADDI"
+  },
+  {
+    "PORT_NAME": "BHILWARA"
+  },
+  {
+    "PORT_NAME": "BHIWANDI"
+  },
+  {
+    "PORT_NAME": "BHOPAL"
+  },
+  {
+    "PORT_NAME": "BOCA RATON"
+  },
+  {
+    "PORT_NAME": "BUNKIE"
+  },
+  {
+    "PORT_NAME": "CALCUTTA"
+  },
+  {
+    "PORT_NAME": "CALIFORNIA"
+  },
+  {
+    "PORT_NAME": "CHENNAI"
+  },
+  {
+    "PORT_NAME": "CHENNAI (EX MADRAS)"
+  },
+  {
+    "PORT_NAME": "CHICAGO"
+  },
+  {
+    "PORT_NAME": "CHITTAGONG"
+  },
+  {
+    "PORT_NAME": "COCHIN"
+  },
+  {
+    "PORT_NAME": "COIMBATORE"
+  },
+  {
+    "PORT_NAME": "DELHI"
+  },
+  {
+    "PORT_NAME": "ENNORE"
+  },
+  {
+    "PORT_NAME": "ERODE"
+  },
+  {
+    "PORT_NAME": "FAISALABAD"
+  },
+  {
+    "PORT_NAME": "FARIDABAD"
+  },
+  {
+    "PORT_NAME": "GARHI HARSARU"
+  }
+  
+  
+  
+  
