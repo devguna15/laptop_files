@@ -1,0 +1,130 @@
+
+                Hi — start by giving a product name or HS code.
+              
+cotton
+Got it. I’ll focus on: cotton
+
+Here are 3 questions you can run:
+Who are the top buyers of cotton in the last 24 months?
+Which countries are showing increasing demand for cotton in the last 24 months?
+Which month does demand for cotton usually peak over the last 36 months?
+
+from which ports i can sell cotton in india
+I can help you find the ports from which you can sell cotton in India. Would you like to proceed with this query?
+Confirm:
+From which ports can I sell cotton in India?
+Proceed
+Cancel
+
+Next best questions:
+Who are the top sellers of cotton?
+Which buyers pay premium prices for cotton?
+Are there any new buyers of cotton in India?
+SQL execution failed.
+
+Follow-up questions:
+Which markets have low competition for cotton in the last 12 months?
+Which buyers pay premium prices for cotton in the last 24 months?
+Which markets have low competition for cotton in the last 12 months?
+
+From which ports can I sell cotton in India?
+It looks like the previous attempt to get this information failed due to a technical issue. I can try again to find the ports from which you can sell cotton in India. Would you like to proceed with this query?
+Confirm:
+From which ports can I sell cotton in India?
+Proceed
+Cancel
+
+Next best questions:
+What is the demand trend for cotton?
+What is the seasonality peak month for cotton exports?
+Which countries are the top buyers of cotton?
+
+Narrative Answer
+For cotton exports by sellers in India between April 1, 2024, and March 31, 2026, four distinct ports of origin were identified: Faisalabad, Karachi, and Semarang. One entry also had an unspecified port of origin.
+Follow-up questions:
+Who are the top buyers of cotton in the last 24 months?
+Which countries are showing increasing demand for cotton in the last 24 months?
+Which month does demand for cotton usually peak over the last 36 months?
+
+what are those ports
+The ports of origin identified for cotton exports by sellers in India between April 1, 2024, and March 31, 2026, were Faisalabad, Karachi, Semarang, and one unspecified port of origin.
+Suggested questions:
+Who are the top sellers of cotton?
+What is the average price of cotton?
+Are there any new buyers of cotton?
+
+what trade question i have asked
+The last trade question you asked was: "From which ports can I sell cotton in India?"
+
+Suggested questions:
+Which markets offer low competition for cotton?
+Who are the high-margin buyers for cotton?
+Are there any new sellers of cotton?
+
+what is the answer for that question
+The answer to your last question, "From which ports can I sell cotton in India?", was: For cotton exports by sellers in India between April 1, 2024, and March 31, 2026, four distinct ports of origin were identified: Faisalabad, Karachi, and Semarang. One entry also had an unspecified port of origin.
+
+Suggested questions:
+What is the total trade value of cotton?
+What is the seasonality peak month for cotton exports?
+What is the trend of cotton exports over the last 24 months?
+
+what is meant by hs code
+An HS code, or Harmonized System code, is a standardized numerical classification system for traded products. It's used by customs authorities worldwide to identify products for duties, taxes, and statistics. It helps ensure consistency in trade data across countries.
+
+Suggested questions:
+Who are the top buyers of cotton?
+What is the total quantity of cotton traded?
+What are the main ports for cotton exports?
+
+i want  to sell cotton
+To help you sell cotton, we can explore potential markets and identify key buyers.
+Suggested questions:
+Which countries have increasing demand for cotton?
+Who are the high-margin buyers for cotton?
+What are the low competition markets for cotton?
+
+i want to export cotton
+To help you export cotton, we can explore various aspects of the market. Here are some questions you might want to ask:
+Suggested questions:
+What is the best month to export cotton?
+Who are the new buyers of cotton?
+What is the average price of cotton?
+
+i asked about you hs code right, what is the hs code for cotton
+Okay.
+Confirm:
+What is the HS code for cotton?
+Proceed
+Cancel
+
+Next best questions:
+Who are the top buyers of cotton?
+What is the total trade value of cotton?
+Which countries are the top exporters of cotton?
+
+Narrative Answer
+The following HS codes are associated with products identified as "cotton" based on shipment data from April 1, 2024, to March 31, 2026. A total of 8,824 distinct HS codes were identified. The top HS codes, ranked by their total shipment value in USD, are:
+
+*   **5205130002**: This code represents the highest total shipment value at $84,391,705,915.81 USD.
+*   **5205120002**: This code follows with a total shipment value of $82,915,007,972.64 USD.
+*   **5208121900**: This code has a total shipment value of $16,941,876,171.43 USD.
+Follow-up questions:
+Who are the top buyers of cotton in the last 24 months?
+Which countries are showing increasing demand for cotton in the last 24 months?
+Which markets have low competition for cotton in the last 12 months?
+
+those 8824 hs codes are for cotton or total unique hs codes for different products
+Those 8,824 HS codes are specifically associated with products identified as "cotton" based on the shipment data from April 1, 2024, to March 31, 2026.
+
+Suggested questions:
+What is the seasonality peak month for cotton?
+Which countries are new entrants as buyers of cotton?
+What is the average price of cotton?
+okay
+
+Okay. What would you like to explore next regarding cotton?
+Suggested questions:
+Who are the high-margin buyers of cotton?
+What is the total export value of cotton?
+Which are the top ports of destination for cotton?
